@@ -1,0 +1,14 @@
+# Bundled into the extension as wheels by scripts/build_extension.sh.
+# numpy is left out: it comes from Blender.
+geopandas
+geonamescache
+matplotlib
+rasterio
+osmnx
+osm2geojson
+gpx
+pillow
+scipy
+databpy
+nodebpy
+d3blender @ git+https://github.com/matthewturk/d3blender

@@ -1,0 +1,74 @@
+# On a `v*` tag, build the per-platform extension zips (linux-x64, macos-arm64,
+# windows-x64), smoke-test the Linux one, and attach them to a GitHub release.
+# Pull requests and manual runs (Actions tab) only upload the zips as a workflow artifact.
+name: Release extension
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BLENDER_VERSION: "5.2.3"
+  # Outside the checkout: the build zips everything under the source dir.
+  BLENDER_DIR: ${{ github.workspace }}/../blender
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag matches the manifest version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          manifest=$(sed -n 's/^version = "\(.*\)"/\1/p' src/avl_geoviz/blender_manifest.toml)
+          if [ "${GITHUB_REF_NAME#v}" != "$manifest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match blender_manifest.toml version $manifest"; exit 1
+          fi
+
+      - uses: astral-sh/setup-uv@v7
+
+      - name: Cache Blender
+        id: blender-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.BLENDER_DIR }}
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Download Blender
+        if: steps.blender-cache.outputs.cache-hit != 'true'
+        run: |
+          minor=${BLENDER_VERSION%.*}
+          mkdir -p "$BLENDER_DIR"
+          curl -fsSL "https://download.blender.org/release/Blender$minor/blender-$BLENDER_VERSION-linux-x64.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$BLENDER_DIR"
+
+      # Blender links these X/GL libraries even in background mode.
+      - name: Install Blender's runtime libraries
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -qy --no-install-recommends \
+            libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libgl1 libegl1
+
+      - name: Build extensions
+        run: scripts/build_extension.sh "$BLENDER_DIR/blender" dist
+
+      - name: Smoke-test the Linux build
+        run: tests/run_smoke.sh "$BLENDER_DIR/blender" dist/*linux_x64.zip --network
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blender-extensions
+          path: dist/*.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true

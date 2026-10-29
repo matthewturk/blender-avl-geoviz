@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "avl_geoviz"
+version = "1.0.0"
+name = "AVL GeoViz"
+tagline = "Globe and map GIS import, GPX tracks and trade-flow emitters"
+maintainer = "Matthew Turk <mjturk@illinois.edu>"
+type = "add-on"
+website = "https://github.com/matthewturk/blender-avl-geoviz"
+tags = ["Import-Export", "Object"]
+# The bundled wheels are cp313, Blender 5.x's Python.
+blender_version_min = "5.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 Matthew Turk"]
+
+[permissions]
+network = "Download boundaries, OpenStreetMap data, map tiles and elevation"
+files = "Import GeoJSON, GPX and CSV files and save downloaded imagery"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+]
