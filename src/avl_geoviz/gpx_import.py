@@ -507,30 +507,22 @@ class VIEW3D_PT_gpx_import(bpy.types.Panel):
     bl_idname = "VIEW3D_PT_gpx_import"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Create"
+    bl_category = "AVL GIS"
+    # Placed through the same Placement settings as the other globe/map
+    # importers, which the parent panel shows.
+    bl_parent_id = "VIEW3D_PT_country_wireframes"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 4
 
     def draw(self, context):
         layout = self.layout
         settings = context.scene.gpx_import_settings
-        coord = context.scene.geo_coord_settings
-
-        layout.prop(coord, "coordinate_space")
-        if coord.coordinate_space == "GLOBE":
-            layout.prop(coord, "globe_radius")
-        else:
-            layout.prop(coord, "flat_unit_mode")
-            if coord.flat_unit_mode == "FIXED":
-                layout.prop(coord, "flat_scale")
-                layout.prop(coord, "flat_fit_to_bbox")
-            layout.prop(coord, "flat_aspect_mode")
-
-        layout.separator()
 
         layout.prop(settings, "gpx_clear_existing")
 
-        layout.separator()
-
-        layout.operator("object.import_gpx", icon="IMPORT")
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator("object.import_gpx", icon="IMPORT")
 
 
 # ---------------------------------------------------------------------------
