@@ -5,6 +5,7 @@ import bpy
 
 from . import (
     geo_coord,
+    osm_area,
     country_wireframes,
     flat_gis_importer,
     gpx_import,
@@ -13,10 +14,13 @@ from . import (
     country_pair_batch_emitter,
 )
 
-# Registration order: data_visualization_menu before the two generators,
+# Registration order: osm_area before the two importers that use its
+# settings; country_wireframes before gpx_import, whose panel is a child of
+# one of its panels; data_visualization_menu before the two generators,
 # which add their entries to its Add-menu category.
 _MODULES = (
     geo_coord,
+    osm_area,
     country_wireframes,
     flat_gis_importer,
     gpx_import,

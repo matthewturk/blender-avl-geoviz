@@ -11,7 +11,7 @@ import bpy
 from bpy_extras.io_utils import ImportHelper
 
 from . import geo_coord
-from . import _osm_safety_shared
+from . import osm_area
 from .geo_coord import (
     flat_project,
     latlon_to_unit,
@@ -1779,89 +1779,15 @@ def _import_geojson_feature_payload(
     return line_created, point_created
 
 
-def _parse_osm_bbox(raw_text):
-    tokens = [token.strip() for token in str(raw_text).split(",") if token.strip()]
-    if len(tokens) != 4:
-        raise RuntimeError("OSM bbox must have 4 comma-separated numbers.")
-
-    south, west, north, east = [float(token) for token in tokens]
-    if south >= north:
-        raise RuntimeError("OSM bbox south must be < north.")
-    if west >= east:
-        raise RuntimeError("OSM bbox west must be < east.")
-    return (south, west, north, east)
+def _osm_preflight_messages(settings, osm):
+    """Thin adapter around the shared preflight check in osm_area, which
+    Local Flat Map's import also uses: the shared area, or the bboxes in
+    the custom query when that's what will run."""
+    custom = settings.osm_custom_query if settings.osm_query_mode == "CUSTOM" else None
+    return osm_area.preflight(osm, custom_query=custom)
 
 
-def _osm_preflight_messages(settings):
-    """Thin settings-object adapter around the shared preflight check in
-    _osm_safety_shared - see that module for the actual threshold logic,
-    which flat_gis_importer.py's OSM importer also uses.
-    """
-    south, west, north, east = _parse_osm_bbox(settings.osm_bbox)
-    area_deg2 = _osm_safety_shared.bbox_area_deg2(south, west, north, east)
-
-    return _osm_safety_shared.osm_preflight_messages(
-        area_deg2,
-        settings.osm_warn_bbox_area_deg2,
-        settings.osm_hard_bbox_area_deg2,
-        settings.osm_max_features,
-        settings.osm_query_mode == "CUSTOM",
-        settings.osm_timeout_seconds,
-    )
-
-
-def _parse_osm_tag_filters(raw_text):
-    tokens = _tokenize_values(raw_text)
-    parsed = []
-    for token in tokens:
-        if "=" not in token:
-            parsed.append((token.strip(), None))
-            continue
-        key, value = token.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if not key:
-            continue
-        parsed.append((key, value if value else None))
-    return parsed
-
-
-def _osm_tags_dict_from_filters(raw_text):
-    tags = {}
-    for key, value in _parse_osm_tag_filters(raw_text):
-        if value is None:
-            tags[key] = True
-            continue
-
-        existing = tags.get(key)
-        if existing is None or existing is True:
-            tags[key] = value
-            continue
-
-        if isinstance(existing, list):
-            if value not in existing:
-                existing.append(value)
-            continue
-
-        if existing != value:
-            tags[key] = [existing, value]
-
-    return tags
-
-
-def _osm_presets_map():
-    return {
-        "BUILDINGS": "building",
-        "ROADS": "highway",
-        "WATER": "waterway,natural=water",
-        "LANDUSE": "landuse,natural",
-        "POI": "amenity,shop,tourism",
-        "BOUNDARIES": "boundary=administrative",
-        "ALL": "building,highway,waterway,natural=water,landuse,natural,amenity,shop,tourism,boundary=administrative",
-    }
-
-
-def _fetch_osm_geojson_with_osmnx(settings):
+def _fetch_osm_geojson_with_osmnx(settings, osm):
     try:
         import osmnx as ox
     except Exception as exc:
@@ -1870,20 +1796,21 @@ def _fetch_osm_geojson_with_osmnx(settings):
             "to enable preset/tag-based OSM import."
         ) from exc
 
-    south, west, north, east = _parse_osm_bbox(settings.osm_bbox)
+    south, west, north, east = osm_area.parse_bbox(osm)
     print(
         f"[Geo Wireframes] Fetching OSM features via osmnx: "
         f"south={south}, west={west}, north={north}, east={east}"
     )
-    tags = _osm_tags_dict_from_filters(settings.osm_tag_filters)
+    tags = osm_area.tags_dict(osm.tag_filters)
     if not tags:
-        tags = {"building": True}
+        raise RuntimeError("Tag Filters is empty; pick a preset or add tags.")
 
-    timeout_s = max(5, int(settings.osm_timeout_seconds))
     try:
-        ox.settings.requests_timeout = timeout_s
+        ox.settings.requests_timeout = osm_area.timeout_seconds(osm)
     except Exception:
         pass
+    # osmnx wants the API root and appends /interpreter itself.
+    ox.settings.overpass_url = osm_area.endpoint(osm).rstrip("/").removesuffix("/interpreter")
 
     gdf = None
 
@@ -1912,7 +1839,7 @@ def _fetch_osm_geojson_with_osmnx(settings):
             "features": [],
         }
 
-    max_features = int(settings.osm_max_features)
+    max_features = int(osm.max_features)
     if max_features > 0 and len(gdf) > max_features:
         gdf = gdf.head(max_features)
 
@@ -1926,77 +1853,6 @@ def _fetch_osm_geojson_with_osmnx(settings):
         gdf = gdf[gdf.geometry.notnull()]
 
     return json.loads(gdf.to_json())
-
-
-def _build_overpass_query_from_settings(settings):
-    if settings.osm_query_mode == "CUSTOM":
-        custom = str(settings.osm_custom_query).strip()
-        if not custom:
-            raise RuntimeError("OSM custom query is empty.")
-        return custom
-
-    south, west, north, east = _parse_osm_bbox(settings.osm_bbox)
-    bbox = f"({south},{west},{north},{east})"
-    filters = _parse_osm_tag_filters(settings.osm_tag_filters)
-
-    selector_lines = []
-    if not filters:
-        selector_lines.append(f"  nwr{bbox};")
-    else:
-        for key, value in filters:
-            if value is None:
-                selector_lines.append(f'  nwr["{key}"]{bbox};')
-            else:
-                selector_lines.append(f'  nwr["{key}"="{value}"]{bbox};')
-
-    timeout_s = max(5, int(settings.osm_timeout_seconds))
-    query = [f"[out:json][timeout:{timeout_s}];", "("]
-    query.extend(selector_lines)
-    query.extend([")", "out body geom;"])
-    return "\n".join(query)
-
-
-def _fetch_overpass_json(endpoint, query, timeout_seconds, max_response_bytes):
-    print(f"[Geo Wireframes] Fetching OSM data from Overpass endpoint {endpoint} ...")
-    encoded = urllib.parse.urlencode({"data": query}).encode("utf-8")
-    request = urllib.request.Request(
-        endpoint,
-        data=encoded,
-        headers={"User-Agent": "BlenderGeoWireframes/1.0"},
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            total = 0
-            chunks = []
-            while True:
-                chunk = response.read(64 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-
-                if total > max_response_bytes:
-                    raise RuntimeError(
-                        "Overpass response exceeded safety limit. "
-                        "Narrow bbox/tags or lower Max Features."
-                    )
-
-            content = b"".join(chunks).decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore") if exc.fp else ""
-        raise RuntimeError(
-            f"Overpass request failed with HTTP {exc.code}. {detail}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Overpass request failed: {exc}") from exc
-
-    print(f"[Geo Wireframes] Overpass fetch complete ({total} bytes).")
-
-    try:
-        return json.loads(content)
-    except Exception as exc:
-        raise RuntimeError(f"Overpass returned invalid JSON: {exc}") from exc
 
 
 def _convert_overpass_to_geojson(overpass_json):
@@ -3029,73 +2885,14 @@ class CountryWireframeSettings(bpy.types.PropertyGroup):
         ),
         default="BBOX_TAGS",
     )
-    osm_preset: bpy.props.EnumProperty(
-        name="Preset",
-        description="Populate common OSM tag filters",
-        items=(
-            ("BUILDINGS", "Buildings", "Building footprints and parts"),
-            ("ROADS", "Roads", "Road network and paths"),
-            ("WATER", "Water", "Waterways and water bodies"),
-            ("LANDUSE", "Landuse", "Landuse and natural areas"),
-            ("POI", "POIs", "Amenities, shops, and tourism points"),
-            (
-                "BOUNDARIES",
-                "Boundaries",
-                "Administrative and political boundaries",
-            ),
-            ("ALL", "All", "All other presets"),
-        ),
-        default="ALL",
-    )
-    osm_endpoint: bpy.props.StringProperty(
-        name="Overpass Endpoint",
-        description="Overpass API interpreter endpoint",
-        default="https://overpass-api.de/api/interpreter",
-    )
+    # Named for OSM, but now only the Blue Marble / cloud download timeout;
+    # OSM requests use the shared osm_area settings.
     osm_timeout_seconds: bpy.props.IntProperty(
-        name="Timeout (s)",
-        description="Network timeout for Overpass request",
+        name="Download Timeout (s)",
+        description="Network timeout for imagery downloads",
         default=45,
         min=5,
         max=600,
-    )
-    osm_require_confirmation: bpy.props.BoolProperty(
-        name="Confirm Large OSM Requests",
-        description="Prompt before potentially large OSM imports",
-        default=True,
-    )
-    osm_bbox: bpy.props.StringProperty(
-        name="BBox",
-        description="south,west,north,east in WGS84 degrees",
-        default="40.70,-74.03,40.75,-73.96",
-    )
-    osm_warn_bbox_area_deg2: bpy.props.FloatProperty(
-        name="Warn Area (deg^2)",
-        description="Show confirmation when bbox area exceeds this threshold",
-        default=0.25,
-        min=0.001,
-        max=100.0,
-        precision=3,
-    )
-    osm_hard_bbox_area_deg2: bpy.props.FloatProperty(
-        name="Hard Area Limit (deg^2)",
-        description="Abort imports above this bbox area",
-        default=2.0,
-        min=0.01,
-        max=1000.0,
-        precision=3,
-    )
-    osm_tag_filters: bpy.props.StringProperty(
-        name="Tag Filters",
-        description="Comma-separated tags, e.g. building, highway=primary",
-        default="building",
-    )
-    osm_max_features: bpy.props.IntProperty(
-        name="Max Features",
-        description="Hard cap on imported OSM features (0 disables cap)",
-        default=2000,
-        min=0,
-        max=200000,
     )
     osm_simplify_tolerance_deg: bpy.props.FloatProperty(
         name="Simplify Tol (deg)",
@@ -3106,20 +2903,13 @@ class CountryWireframeSettings(bpy.types.PropertyGroup):
         step=0.1,
         precision=6,
     )
-    osm_max_response_mb: bpy.props.IntProperty(
-        name="Max Response (MB)",
-        description="Abort if Overpass response exceeds this size",
-        default=64,
-        min=5,
-        max=1024,
-    )
     osm_custom_query: bpy.props.StringProperty(
         name="Overpass QL",
         description="Custom Overpass query (must include out clause)",
         default=(
             "[out:json][timeout:45];\n"
             "(\n"
-            '  nwr["building"](40.70,-74.03,40.75,-73.96);\n'
+            f'  nwr["building"]({osm_area.DEFAULT_BBOX});\n'
             ");\n"
             "out body geom;"
         ),
@@ -3268,38 +3058,27 @@ class OBJECT_OT_import_geojson_wireframes(bpy.types.Operator, ImportHelper):
         return {"FINISHED"}
 
 
-class OBJECT_OT_apply_osm_preset(bpy.types.Operator):
-    bl_idname = "object.apply_osm_preset"
-    bl_label = "Apply OSM Preset"
-    bl_description = "Fill OSM tag filters from preset"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        settings = context.scene.country_wireframe_settings
-        mapping = _osm_presets_map()
-        tag_filter = mapping.get(settings.osm_preset, "building")
-        settings.osm_tag_filters = tag_filter
-        self.report({"INFO"}, f"OSM preset applied: {tag_filter}")
-        return {"FINISHED"}
-
-
 class OBJECT_OT_import_osm_overpass(bpy.types.Operator):
     bl_idname = "object.import_osm_overpass"
-    bl_label = "Import OSM (Overpass)"
-    bl_description = "Fetch OSM data through Overpass, convert to GeoJSON, and import"
+    bl_label = "Import onto Globe / Map"
+    bl_description = (
+        "Fetch the OpenStreetMap features chosen under Area & Features and "
+        "import them as per-feature wireframes, placed on the globe or world map"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     preflight_warning: bpy.props.StringProperty(default="", options={"HIDDEN"})
 
     def invoke(self, context, _event):
         settings = context.scene.country_wireframe_settings
+        osm = osm_area.get(context)
         try:
-            warnings = _osm_preflight_messages(settings)
+            warnings = _osm_preflight_messages(settings, osm)
         except Exception as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
-        if settings.osm_require_confirmation and warnings:
+        if osm.require_confirmation and warnings:
             self.preflight_warning = "\n".join(warnings)
             return context.window_manager.invoke_props_dialog(self, width=560)
 
@@ -3318,24 +3097,26 @@ class OBJECT_OT_import_osm_overpass(bpy.types.Operator):
 
     def execute(self, context):
         settings = context.scene.country_wireframe_settings
+        osm = osm_area.get(context)
 
         try:
+            # Again here, not just in invoke: scripts and redo skip invoke,
+            # and the hard limits shouldn't depend on how it was called.
+            _osm_preflight_messages(settings, osm)
             if settings.osm_query_mode == "CUSTOM":
-                endpoint = str(settings.osm_endpoint).strip()
-                if not endpoint:
-                    raise RuntimeError("OSM endpoint is empty.")
-
-                query = _build_overpass_query_from_settings(settings)
-                overpass_json = _fetch_overpass_json(
-                    endpoint,
+                query = str(settings.osm_custom_query).strip()
+                if not query:
+                    raise RuntimeError("OSM custom query is empty.")
+                overpass_json = osm_area.fetch_overpass_json(
+                    osm,
                     query,
-                    max(5, int(settings.osm_timeout_seconds)),
-                    max(1, int(settings.osm_max_response_mb)) * 1024 * 1024,
+                    user_agent="BlenderGeoWireframes/1.0",
+                    log_prefix="[Geo Wireframes]",
                 )
                 geojson = _convert_overpass_to_geojson(overpass_json)
-                source_label = f"overpass:{endpoint}"
+                source_label = f"overpass:{osm_area.endpoint(osm)}"
             else:
-                geojson = _fetch_osm_geojson_with_osmnx(settings)
+                geojson = _fetch_osm_geojson_with_osmnx(settings, osm)
                 source_label = "osmnx"
 
             payload = _load_geojson_feature_payload_from_data(geojson)
@@ -3858,15 +3639,27 @@ class OBJECT_OT_build_geo_nodes_source(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class VIEW3D_PT_country_wireframes(bpy.types.Panel):
-    bl_label = "Geo Wireframes"
-    bl_idname = "VIEW3D_PT_country_wireframes"
+# Sidebar layout ("AVL GIS" tab): Area & Features (osm_area.py) at the top,
+# shared by everything that fetches OpenStreetMap; then this panel, whose
+# importers all place data through the same globe / world-map settings, so
+# they hang off it; then Local Flat Map (flat_gis_importer.py), a separate
+# metric scene of the same area. Rarely touched options sit in collapsed
+# sub-panels. Panel idnames are kept from the old "Create" tab layout.
+class _AVLGISPanel:
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category = "Create"
+    bl_category = "AVL GIS"
+
+
+class VIEW3D_PT_country_wireframes(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "Globe & World Map"
+    bl_idname = "VIEW3D_PT_country_wireframes"
+    bl_order = 1
 
     def draw(self, context):
         layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
         coord = context.scene.geo_coord_settings
 
         layout.prop(coord, "coordinate_space")
@@ -3881,13 +3674,11 @@ class VIEW3D_PT_country_wireframes(bpy.types.Panel):
         layout.prop(coord, "overlay_offset")
 
 
-class VIEW3D_PT_country_wireframes_build(bpy.types.Panel):
+class VIEW3D_PT_country_wireframes_build(_AVLGISPanel, bpy.types.Panel):
     bl_label = "Country Wireframes"
     bl_idname = "VIEW3D_PT_country_wireframes_build"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Create"
     bl_parent_id = "VIEW3D_PT_country_wireframes"
+    bl_order = 0
 
     def draw(self, context):
         layout = self.layout
@@ -3897,8 +3688,11 @@ class VIEW3D_PT_country_wireframes_build(bpy.types.Panel):
         row.prop(settings, "countries_enabled", toggle=True)
         row.prop(settings, "continents_enabled", toggle=True)
 
-        layout.prop(settings, "generation_mode")
-        layout.prop(settings, "world_dataset_scale")
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(settings, "generation_mode")
+        col.prop(settings, "world_dataset_scale")
 
         row = layout.row()
         row.template_list(
@@ -3908,7 +3702,7 @@ class VIEW3D_PT_country_wireframes_build(bpy.types.Panel):
             "country_items",
             settings,
             "country_index",
-            rows=10,
+            rows=8,
         )
         col = row.column(align=True)
         col.operator("object.refresh_geo_country_list", text="", icon="FILE_REFRESH")
@@ -3920,164 +3714,195 @@ class VIEW3D_PT_country_wireframes_build(bpy.types.Panel):
         )
 
         layout.prop(settings, "continents")
-
-        layout.separator()
-
-        layout.prop(settings, "resolution")
-        layout.prop(settings, "create_reference_globe")
-
-        layout.separator()
-
-        layout.prop(settings, "marker_scale")
-        layout.prop(settings, "continent_scale")
-        layout.prop(settings, "add_surface_mesh")
-
-        layout.separator()
-
         layout.prop(settings, "clear_existing")
-        layout.operator(
+
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator(
             "object.create_country_wireframes",
             icon="MESH_UVSPHERE",
         )
-
-        layout.separator()
-
         layout.operator(
             "object.build_geo_nodes_source",
             icon="NODETREE",
         )
 
 
-class VIEW3D_PT_country_wireframes_geojson(bpy.types.Panel):
+class VIEW3D_PT_country_wireframes_build_display(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "Display"
+    bl_idname = "VIEW3D_PT_country_wireframes_build_display"
+    bl_parent_id = "VIEW3D_PT_country_wireframes_build"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        settings = context.scene.country_wireframe_settings
+
+        layout.prop(settings, "resolution")
+        layout.prop(settings, "create_reference_globe")
+        layout.prop(settings, "add_surface_mesh")
+        layout.prop(settings, "marker_scale")
+        layout.prop(settings, "continent_scale")
+
+
+class VIEW3D_PT_country_wireframes_geojson(_AVLGISPanel, bpy.types.Panel):
     bl_label = "GeoJSON Import"
     bl_idname = "VIEW3D_PT_country_wireframes_geojson"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Create"
     bl_parent_id = "VIEW3D_PT_country_wireframes"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 1
 
     def draw(self, context):
         layout = self.layout
         settings = context.scene.country_wireframe_settings
-        coord = context.scene.geo_coord_settings
 
-        layout.prop(settings, "geojson_output_mode")
-        if settings.geojson_output_mode == "CURVE":
-            layout.prop(settings, "geojson_curve_spline_type")
-            layout.prop(settings, "geojson_curve_step_deg")
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(settings, "geojson_output_mode")
+        col.prop(settings, "geojson_point_mode")
+        _draw_clear_existing(col, settings, "geojson_clear_existing", "geojson_existing_data_mode")
 
-        layout.separator()
-
-        layout.prop(settings, "geojson_point_mode")
-        if settings.geojson_point_mode == "SPHERE":
-            layout.prop(settings, "geojson_point_scale")
-            layout.prop(settings, "geojson_point_resolution")
-
-        layout.separator()
-
-        layout.prop(settings, "geojson_simplify_tolerance_deg")
-        if coord.coordinate_space == "GLOBE":
-            layout.prop(settings, "geojson_spherical_tolerance_deg")
-        layout.prop(settings, "geojson_split_collections")
-
-        layout.separator()
-
-        layout.prop(settings, "geojson_clear_existing")
-        if settings.geojson_clear_existing:
-            layout.prop(settings, "geojson_existing_data_mode")
-        layout.operator(
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator(
             "object.import_geojson_wireframes",
             icon="IMPORT",
         )
 
 
-class VIEW3D_PT_country_wireframes_osm(bpy.types.Panel):
-    bl_label = "OSM Import"
+class VIEW3D_PT_country_wireframes_geojson_geometry(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "Geometry"
+    bl_idname = "VIEW3D_PT_country_wireframes_geojson_geometry"
+    bl_parent_id = "VIEW3D_PT_country_wireframes_geojson"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        _draw_geojson_geometry_options(self.layout, context)
+
+
+def _draw_geojson_geometry_options(layout, context):
+    """Curve, point and simplification options, shared by GeoJSON and OSM
+    import (OSM results go through the same GeoJSON importer)."""
+    layout.use_property_split = True
+    layout.use_property_decorate = False
+    settings = context.scene.country_wireframe_settings
+    coord = context.scene.geo_coord_settings
+
+    if settings.geojson_output_mode == "CURVE":
+        layout.prop(settings, "geojson_curve_spline_type")
+        layout.prop(settings, "geojson_curve_step_deg")
+    if settings.geojson_point_mode == "SPHERE":
+        layout.prop(settings, "geojson_point_scale")
+        layout.prop(settings, "geojson_point_resolution")
+    layout.prop(settings, "geojson_simplify_tolerance_deg")
+    if coord.coordinate_space == "GLOBE":
+        layout.prop(settings, "geojson_spherical_tolerance_deg")
+    layout.prop(settings, "geojson_split_collections")
+
+
+def _draw_clear_existing(layout, settings, clear_prop, mode_prop):
+    row = layout.row(heading="Existing Imports")
+    row.prop(settings, clear_prop, text="Clear")
+    sub = row.row()
+    sub.active = getattr(settings, clear_prop)
+    sub.prop(settings, mode_prop, text="")
+
+
+class VIEW3D_PT_country_wireframes_osm(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "OpenStreetMap"
     bl_idname = "VIEW3D_PT_country_wireframes_osm"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Create"
     bl_parent_id = "VIEW3D_PT_country_wireframes"
+    bl_order = 2
 
     def draw(self, context):
         layout = self.layout
         settings = context.scene.country_wireframe_settings
 
-        row = layout.row(align=True)
-        row.prop(settings, "osm_preset")
-        row.operator("object.apply_osm_preset", text="Apply", icon="PRESET")
-        layout.prop(settings, "osm_tag_filters")
-        layout.prop(settings, "osm_bbox")
-
-        layout.separator()
-
-        layout.prop(settings, "osm_query_mode")
         if settings.osm_query_mode == "CUSTOM":
-            layout.prop(settings, "osm_endpoint")
-            layout.prop(settings, "osm_custom_query")
+            box = layout.box()
+            box.label(text="Using the custom Overpass query", icon="CONSOLE")
+            box.label(text="(Advanced Query, below)", icon="BLANK1")
+        else:
+            osm = osm_area.get(context)
+            name = bpy.types.UILayout.enum_item_name(osm, "preset", osm.preset)
+            layout.label(text=f"Fetches: {name} (Area & Features)", icon="WORLD")
 
-        layout.separator()
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        _draw_clear_existing(col, settings, "osm_clear_existing", "osm_existing_data_mode")
+        col.prop(settings, "osm_simplify_tolerance_deg")
 
-        layout.prop(settings, "osm_timeout_seconds")
-        layout.prop(settings, "osm_max_features")
-        layout.prop(settings, "osm_max_response_mb")
-        layout.prop(settings, "osm_simplify_tolerance_deg")
-
-        layout.separator()
-
-        layout.prop(settings, "osm_require_confirmation")
-        if settings.osm_require_confirmation:
-            layout.prop(settings, "osm_warn_bbox_area_deg2")
-            layout.prop(settings, "osm_hard_bbox_area_deg2")
-
-        layout.separator()
-
-        layout.prop(settings, "osm_clear_existing")
-        if settings.osm_clear_existing:
-            layout.prop(settings, "osm_existing_data_mode")
-        layout.operator(
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator(
             "object.import_osm_overpass",
             icon="URL",
         )
 
 
-class VIEW3D_PT_country_wireframes_imagery(bpy.types.Panel):
+class VIEW3D_PT_country_wireframes_osm_geometry(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "Geometry"
+    bl_idname = "VIEW3D_PT_country_wireframes_osm_geometry"
+    bl_parent_id = "VIEW3D_PT_country_wireframes_osm"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 0
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.country_wireframe_settings
+        layout.label(text="Shared with GeoJSON Import", icon="LINKED")
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(settings, "geojson_output_mode")
+        col.prop(settings, "geojson_point_mode")
+        _draw_geojson_geometry_options(layout.column(), context)
+
+
+class VIEW3D_PT_country_wireframes_osm_query(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "Advanced Query"
+    bl_idname = "VIEW3D_PT_country_wireframes_osm_query"
+    bl_parent_id = "VIEW3D_PT_country_wireframes_osm"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 1
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        settings = context.scene.country_wireframe_settings
+
+        layout.prop(settings, "osm_query_mode")
+        if settings.osm_query_mode == "CUSTOM":
+            layout.prop(settings, "osm_custom_query")
+
+
+class VIEW3D_PT_country_wireframes_imagery(_AVLGISPanel, bpy.types.Panel):
     bl_label = "Imagery"
     bl_idname = "VIEW3D_PT_country_wireframes_imagery"
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Create"
     bl_parent_id = "VIEW3D_PT_country_wireframes"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 3
 
     def draw(self, context):
         layout = self.layout
         settings = context.scene.country_wireframe_settings
 
-        layout.prop(settings, "imagery_quality")
+        col = layout.column()
+        col.use_property_split = True
+        col.use_property_decorate = False
+        col.prop(settings, "imagery_quality", text="Blue Marble")
         if settings.imagery_quality == "CUSTOM":
-            layout.prop(settings, "imagery_blue_marble_url")
-        layout.prop(settings, "imagery_max_size")
+            col.prop(settings, "imagery_blue_marble_url")
+        col.prop(settings, "imagery_max_size")
 
-        layout.separator()
-
-        layout.prop(settings, "imagery_use_clouds")
-        if settings.imagery_use_clouds:
-            layout.prop(settings, "imagery_clouds_url")
-            layout.prop(settings, "imagery_animate_clouds")
-            if settings.imagery_animate_clouds:
-                layout.prop(settings, "imagery_cloud_rotation_period_frames")
-
-        layout.separator()
-
-        layout.prop(settings, "imagery_require_confirmation")
-        if settings.imagery_require_confirmation:
-            layout.prop(settings, "imagery_max_download_mb")
-        layout.prop(settings, "imagery_max_local_file_mb")
-        layout.prop(settings, "imagery_max_source_pixels")
-
-        layout.separator()
-
-        layout.operator(
+        col = layout.column(align=True)
+        col.scale_y = 1.3
+        col.operator(
             "object.apply_blue_marble_texture",
             icon="IMAGE_DATA",
         )
@@ -4085,6 +3910,50 @@ class VIEW3D_PT_country_wireframes_imagery(bpy.types.Panel):
             "object.apply_texture_from_raster",
             icon="FILE_IMAGE",
         )
+
+
+class VIEW3D_PT_country_wireframes_imagery_clouds(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "Clouds"
+    bl_idname = "VIEW3D_PT_country_wireframes_imagery_clouds"
+    bl_parent_id = "VIEW3D_PT_country_wireframes_imagery"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 0
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.country_wireframe_settings, "imagery_use_clouds", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        settings = context.scene.country_wireframe_settings
+
+        layout.active = settings.imagery_use_clouds
+        layout.prop(settings, "imagery_clouds_url")
+        layout.prop(settings, "imagery_animate_clouds")
+        if settings.imagery_animate_clouds:
+            layout.prop(settings, "imagery_cloud_rotation_period_frames")
+
+
+class VIEW3D_PT_country_wireframes_imagery_limits(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "Download Limits"
+    bl_idname = "VIEW3D_PT_country_wireframes_imagery_limits"
+    bl_parent_id = "VIEW3D_PT_country_wireframes_imagery"
+    bl_options = {"DEFAULT_CLOSED"}
+    bl_order = 1
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        settings = context.scene.country_wireframe_settings
+
+        layout.prop(settings, "imagery_require_confirmation")
+        if settings.imagery_require_confirmation:
+            layout.prop(settings, "imagery_max_download_mb")
+        layout.prop(settings, "imagery_max_local_file_mb")
+        layout.prop(settings, "osm_timeout_seconds")
+        layout.prop(settings, "imagery_max_source_pixels")
 
 
 CLASSES = (
@@ -4095,7 +3964,6 @@ CLASSES = (
     OBJECT_OT_select_none_geo_countries,
     CountryWireframeSettings,
     OBJECT_OT_import_geojson_wireframes,
-    OBJECT_OT_apply_osm_preset,
     OBJECT_OT_import_osm_overpass,
     OBJECT_OT_apply_blue_marble_texture,
     OBJECT_OT_apply_texture_from_raster,
@@ -4103,9 +3971,15 @@ CLASSES = (
     OBJECT_OT_build_geo_nodes_source,
     VIEW3D_PT_country_wireframes,
     VIEW3D_PT_country_wireframes_build,
+    VIEW3D_PT_country_wireframes_build_display,
     VIEW3D_PT_country_wireframes_geojson,
+    VIEW3D_PT_country_wireframes_geojson_geometry,
     VIEW3D_PT_country_wireframes_osm,
+    VIEW3D_PT_country_wireframes_osm_geometry,
+    VIEW3D_PT_country_wireframes_osm_query,
     VIEW3D_PT_country_wireframes_imagery,
+    VIEW3D_PT_country_wireframes_imagery_clouds,
+    VIEW3D_PT_country_wireframes_imagery_limits,
 )
 
 

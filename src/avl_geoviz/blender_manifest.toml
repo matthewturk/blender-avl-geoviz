@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "avl_geoviz"
-version = "1.2.0"
+version = "1.2.1"
 name = "AVL GeoViz"
 tagline = "Globe and map GIS import, GPX tracks and trade-flow emitters"
 maintainer = "Matthew Turk <mjturk@illinois.edu>"
