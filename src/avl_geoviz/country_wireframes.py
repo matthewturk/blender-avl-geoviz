@@ -1611,7 +1611,13 @@ def _import_geojson_feature_payload(
     line_created = 0
     point_created = 0
     unknown_type_count = 0
-    latlon_bounds = _bounds_from_geojson_payload(payload) if coord_settings.flat_fit_to_bbox else None
+    # Flat projections need the data bounds for their reference latitude even
+    # when not fitting to them (see flat_project).
+    latlon_bounds = (
+        _bounds_from_geojson_payload(payload)
+        if coord_settings.coordinate_space == "FLAT"
+        else None
+    )
 
     sphere_mesh = None
     if settings.geojson_point_mode == "SPHERE":
@@ -3568,7 +3574,7 @@ class OBJECT_OT_create_country_wireframes(bpy.types.Operator):
             selected_continent_items.append(item)
 
         latlon_bounds = None
-        if coord_settings.coordinate_space == "FLAT" and coord_settings.flat_fit_to_bbox:
+        if coord_settings.coordinate_space == "FLAT":
             for row in selected_country_rows:
                 latlon_bounds = _merge_bounds(latlon_bounds, _bounds_from_geometry(row.geometry))
             for item in selected_continent_items:

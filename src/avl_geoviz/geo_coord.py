@@ -107,8 +107,12 @@ def flat_project(lat_deg, lon_deg, settings, bounds=None):
     mode = settings.flat_unit_mode
     aspect = getattr(settings, "flat_aspect_mode", "PRESERVE")
 
+    # *bounds* always supplies the reference latitude for aspect correction;
+    # it only becomes the fit/normalize target when flat_fit_to_bbox is on.
+    fit = bounds is not None and settings.flat_fit_to_bbox
+
     if mode == "NORMALIZED":
-        b = bounds if bounds is not None else (-180.0, -90.0, 180.0, 90.0)
+        b = bounds if fit else (-180.0, -90.0, 180.0, 90.0)
         if aspect == "PRESERVE":
             return latlon_to_xy_normalized(lat_deg, lon_deg, b)
         # STRETCH: normalize both axes independently to [0, 1]
@@ -124,7 +128,7 @@ def flat_project(lat_deg, lon_deg, settings, bounds=None):
         return latlon_to_xy_metric(lat_deg, lon_deg, ref_lat)
 
     # FIXED
-    if settings.flat_fit_to_bbox and bounds is not None:
+    if fit:
         if aspect == "PRESERVE":
             return latlon_to_xy_with_bounds(
                 lat_deg, lon_deg, settings.flat_scale, bounds,
@@ -140,15 +144,14 @@ def flat_project(lat_deg, lon_deg, settings, bounds=None):
         return (x, y, 0.0)
 
     if aspect == "PRESERVE":
-        # Apply cos(lat) correction to longitude (X) so 1 deg lon and 1 deg
-        # lat have the same visual length: meridians converge away from the
-        # equator, so a degree of longitude covers less ground the higher
-        # |lat| gets. With no bounds available here, each point corrects
-        # against its own latitude rather than one shared reference, so this
-        # is only locally affine - it shears slightly across a
-        # wide-latitude-range dataset. Pass bounds (flat_fit_to_bbox) for a
-        # single reference latitude instead.
-        cos_lat = math.cos(math.radians(lat_deg))
+        # Scale longitude (X) by cos(ref_lat) so 1 deg lon and 1 deg lat have
+        # the same visual length near the data. This must be ONE shared
+        # reference latitude: scaling each point by its own cos(lat) is a
+        # sinusoidal projection, which shears shapes in proportion to |lon|
+        # (e.g. Colorado's west edge leans ~50 degrees). Without bounds there
+        # is no data center, so fall back to the equator (no correction).
+        ref_lat = (bounds[1] + bounds[3]) / 2.0 if bounds is not None else 0.0
+        cos_lat = math.cos(math.radians(ref_lat))
         return (lon_deg * settings.flat_scale * cos_lat, lat_deg * settings.flat_scale, 0.0)
 
     return latlon_to_xy(lat_deg, lon_deg, settings.flat_scale)

@@ -143,7 +143,17 @@ def _collect_all_attrs(segments, attr_extractor):
     return all_keys
 
 
-def _track_mesh(name, track, coord_settings):
+def _latlon_bounds(points):
+    """(min_lon, min_lat, max_lon, max_lat) of GPX points, for the flat
+    projection's reference latitude (see geo_coord.flat_project)."""
+    lats = [float(pt.lat) for pt in points]
+    lons = [float(pt.lon) for pt in points]
+    if not lats:
+        return None
+    return (min(lons), min(lats), max(lons), max(lats))
+
+
+def _track_mesh(name, track, coord_settings, bounds=None):
     """Wire mesh for one track (or route), one edge chain per segment, with
     every GPX point field as a POINT attribute. None if it has no points."""
     segments = [seg.trkpt for seg in track.trkseg if seg.trkpt]
@@ -166,7 +176,7 @@ def _track_mesh(name, track, coord_settings):
             lon = float(pt.lon)
             ele = float(pt.ele) if pt.ele is not None else 0.0
 
-            x, y, z = project_point(lat, lon, ele, coord_settings)
+            x, y, z = project_point(lat, lon, ele, coord_settings, bounds)
 
             vertices.append((x, y, z))
 
@@ -219,7 +229,7 @@ def _track_props(track):
     return props
 
 
-def _wpt_mesh(name, waypoints, coord_settings):
+def _wpt_mesh(name, waypoints, coord_settings, bounds=None):
     """Point-only mesh, one vertex per waypoint. None if there are none."""
     if not waypoints:
         return None
@@ -236,7 +246,7 @@ def _wpt_mesh(name, waypoints, coord_settings):
         lon = float(pt.lon)
         ele = float(pt.ele) if pt.ele is not None else 0.0
 
-        x, y, z = project_point(lat, lon, ele, coord_settings)
+        x, y, z = project_point(lat, lon, ele, coord_settings, bounds)
 
         vertices.append((x, y, z))
 
@@ -368,12 +378,20 @@ def _do_import(context, filepath, settings):
         for obj in list(gpx_coll.objects):
             bpy.data.objects.remove(obj, do_unlink=True)
 
+    # One shared bounds for the whole file so every track, route and
+    # waypoint uses the same flat-projection reference and stays aligned.
+    bounds = _latlon_bounds(
+        [pt for trk in gpx_data.trk for seg in trk.trkseg for pt in (seg.trkpt or [])]
+        + [pt for rte in gpx_data.rte for pt in (rte.rtept or [])]
+        + list(gpx_data.wpt or [])
+    )
+
     track_items = []
 
     for idx, track in enumerate(gpx_data.trk, start=1):
         tname = track.name or f"Track_{idx}"
         safe = tname.replace(" ", "_").replace("/", "_")[:60]
-        mesh = _track_mesh(f"GPX_{safe}", track, coord_settings)
+        mesh = _track_mesh(f"GPX_{safe}", track, coord_settings, bounds)
         if mesh is not None:
             track_items.append({
                 "key": f"trk:{idx}",
@@ -401,7 +419,7 @@ def _do_import(context, filepath, settings):
                 "type": rte.type,
                 "trkseg": [seg],
             })()
-            mesh = _track_mesh(f"GPX_{safe}", proxy, coord_settings)
+            mesh = _track_mesh(f"GPX_{safe}", proxy, coord_settings, bounds)
             if mesh is not None:
                 track_items.append({
                     "key": f"rte:{idx}",
@@ -416,7 +434,7 @@ def _do_import(context, filepath, settings):
                 })
 
     wpt_items = []
-    mesh = _wpt_mesh(f"GPX_Waypoints_{file_label}", gpx_data.wpt, coord_settings)
+    mesh = _wpt_mesh(f"GPX_Waypoints_{file_label}", gpx_data.wpt, coord_settings, bounds)
     if mesh is not None:
         wpt_items.append({
             "key": "wpt",
