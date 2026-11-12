@@ -180,13 +180,18 @@ def geotiff_layer():
     layers = [n for m in globe.data.materials for n in m.node_tree.nodes
               if n.bl_idname == "ShaderNodeGroup" and n.node_tree.name == "GeoTIFF: " + name]
     assert layers, "layer not added to the reference globe"
-    # Projected rasters are refused rather than misplaced.
+    # Projected rasters are refused unless reprojecting is turned on.
+    utm = tif("EPSG:32616", (3e5, 4e6, 4e5, 4.1e6))
     try:
-        bpy.ops.object.add_geotiff_layer(filepath=tif("EPSG:32616", (3e5, 4e6, 4e5, 4.1e6)))
+        bpy.ops.object.add_geotiff_layer(filepath=utm)
         raise AssertionError("projected raster was accepted")
     except RuntimeError as exc:
         assert "Reproject" in str(exc), exc
-    return f"{image.size[0]}x{image.size[1]} layer on the reference globe; projected raster refused"
+    assert bpy.ops.object.add_geotiff_layer(filepath=utm, reproject=True) == {"FINISHED"}
+    warped = bpy.data.images[os.path.splitext(os.path.basename(utm))[0]]
+    assert warped["geo_reprojected_from"] == "EPSG:32616", warped.get("geo_reprojected_from")
+    return (f"{image.size[0]}x{image.size[1]} layer on the reference globe; projected raster "
+            "refused, then reprojected when asked")
 
 
 def natural_earth():

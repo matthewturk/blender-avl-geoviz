@@ -1,9 +1,11 @@
 """Drape GeoTIFFs over geo objects as material layers.
 
 A GeoTIFF has to be in longitude/latitude (a geographic CRS such as
-EPSG:4326) and north-up; anything else is reprojected outside Blender first
-(``gdalwarp -t_srs EPSG:4326 in.tif out.tif``). Its bounds then place it with
-a plain linear map, so no UVs are stored on the objects:
+EPSG:4326) and north-up. Anything else is either reprojected outside
+Blender first (``gdalwarp -t_srs EPSG:4326 in.tif out.tif``) or, with the
+operator's opt-in Reproject to Lon/Lat, warped to EPSG:4326 in memory.
+Its bounds then place it with a plain linear map, so no UVs are stored on
+the objects:
 
 * Geo LonLat (shader group) gets longitude/latitude back from the shaded
   point's object-local position: the direction from the center for globe
@@ -257,51 +259,75 @@ def ensure_raster_uv_group():
 #  GeoTIFF -> Blender image
 # ---------------------------------------------------------------------------
 
-def read_geotiff(path, max_size=4096):
+def _placement_problem(src, name):
+    """Why *src* can't be placed as is (None if it can)."""
+    if not src.crs.is_geographic:
+        return f"{name} is in {src.crs.to_string()}, not longitude/latitude."
+    t = src.transform
+    if t.b != 0 or t.d != 0:
+        return f"{name} is rotated or sheared."
+    return None
+
+
+def read_geotiff(path, max_size=4096, reproject=False):
     """Read a north-up, longitude/latitude GeoTIFF.
+
+    With *reproject*, a projected or rotated GeoTIFF is first warped to
+    north-up EPSG:4326 in memory (bilinear; the file isn't changed). Without
+    it, such files are refused.
 
     Returns a dict with "pixels" (h x w x 4 float32 RGBA, bottom row first,
     alpha 0 at nodata), "bounds" (west, south, east, north), "is_data"
-    (single-band rasters are kept as raw values in R, G and B), "value_range"
-    and "crs". Raises GeoTiffError for files it can't place.
+    (single-band rasters are kept as raw values in R, G and B), "value_range",
+    "crs" and "reprojected_from" (the file's CRS if it was warped, else
+    None). Raises GeoTiffError for files it can't place.
     """
     import numpy as np
     import rasterio
     from rasterio.enums import Resampling
+    from rasterio.vrt import WarpedVRT
 
     name = os.path.basename(path)
-    with rasterio.open(path) as src:
-        if src.crs is None:
+    with rasterio.open(path) as file:
+        if file.crs is None:
             raise GeoTiffError(f"{name} has no coordinate reference system.")
-        if not src.crs.is_geographic:
-            raise GeoTiffError(
-                f"{name} is in {src.crs.to_string()}, not longitude/latitude. "
-                f"Reproject it first, e.g. gdalwarp -t_srs EPSG:4326 in.tif out.tif"
-            )
-        t = src.transform
-        if t.b != 0 or t.d != 0:
-            raise GeoTiffError(
-                f"{name} is rotated or sheared. Warp it to north-up first, e.g. "
-                f"gdalwarp -t_srs EPSG:4326 in.tif out.tif"
-            )
-        if src.count < 1:
+        if file.count < 1:
             raise GeoTiffError(f"{name} has no bands.")
-
-        scale = min(1.0, max_size / float(max(src.width, src.height)))
-        w = max(1, int(round(src.width * scale)))
-        h = max(1, int(round(src.height * scale)))
-        is_data = src.count < 3
-        indexes = [1] if is_data else [1, 2, 3]
-        data = src.read(
-            indexes=indexes,
-            out_shape=(len(indexes), h, w),
-            resampling=Resampling.bilinear,
-            masked=True,
-        )
-        valid = src.dataset_mask(out_shape=(h, w)) > 0
-        bounds = tuple(src.bounds)  # left, bottom, right, top
-        north_up = t.e < 0
-        crs = src.crs.to_string()
+        is_data = file.count < 3
+        reprojected_from = None
+        src = file
+        problem = _placement_problem(file, name)
+        if problem:
+            if not reproject:
+                raise GeoTiffError(
+                    f"{problem} Turn on Reproject to Lon/Lat, or reproject it first, "
+                    f"e.g. gdalwarp -t_srs EPSG:4326 in.tif out.tif"
+                )
+            reprojected_from = file.crs.to_string()
+            # Without a nodata value the area outside the warped footprint
+            # would be opaque black; an alpha band marks it as nodata.
+            src = WarpedVRT(
+                file, crs="EPSG:4326", resampling=Resampling.bilinear,
+                add_alpha=file.nodata is None,
+            )
+        try:
+            scale = min(1.0, max_size / float(max(src.width, src.height)))
+            w = max(1, int(round(src.width * scale)))
+            h = max(1, int(round(src.height * scale)))
+            indexes = [1] if is_data else [1, 2, 3]
+            data = src.read(
+                indexes=indexes,
+                out_shape=(len(indexes), h, w),
+                resampling=Resampling.bilinear,
+                masked=True,
+            )
+            valid = src.dataset_mask(out_shape=(h, w)) > 0
+            bounds = tuple(src.bounds)  # left, bottom, right, top
+            north_up = src.transform.e < 0
+            crs = src.crs.to_string()
+        finally:
+            if src is not file:
+                src.close()
 
     # A pixel is nodata where the dataset mask says so (for per-band nodata
     # values, where every band is nodata), not where any one band is: a pure
@@ -337,6 +363,7 @@ def read_geotiff(path, max_size=4096):
         "is_data": is_data,
         "value_range": value_range,
         "crs": crs,
+        "reprojected_from": reprojected_from,
         "size": (w, h),
     }
 
@@ -367,6 +394,10 @@ def _image_from_raster(name, path, raster):
     image["geo_bounds"] = raster["bounds"]
     image["geo_crs"] = raster["crs"]
     image["geo_is_data"] = raster["is_data"]
+    if raster["reprojected_from"]:
+        image["geo_reprojected_from"] = raster["reprojected_from"]
+    elif "geo_reprojected_from" in image:
+        del image["geo_reprojected_from"]
     if raster["value_range"] is not None:
         image["geo_value_range"] = raster["value_range"]
     return image
@@ -546,6 +577,16 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
 
     filename_ext = ".tif"
     filter_glob: bpy.props.StringProperty(default="*.tif;*.tiff", options={"HIDDEN"})
+    reproject: bpy.props.BoolProperty(
+        name="Reproject to Lon/Lat",
+        description=(
+            "Warp a projected or rotated GeoTIFF to longitude/latitude "
+            "(EPSG:4326) in memory. For anything that needs care (datum "
+            "shifts, antimeridian or polar data, choosing resampling), "
+            "reproject it outside Blender instead"
+        ),
+        default=False,
+    )
     max_size: bpy.props.IntProperty(
         name="Max Size",
         description="Downsample the raster so neither side is larger than this many pixels",
@@ -562,7 +603,7 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
             targets = [_ensure_reference_globe(context, context.scene.country_wireframe_settings)]
 
         try:
-            raster = read_geotiff(self.filepath, self.max_size)
+            raster = read_geotiff(self.filepath, self.max_size, self.reproject)
         except GeoTiffError as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
@@ -579,6 +620,8 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
         w, h = raster["size"]
         kind = "data" if raster["is_data"] else "color"
         message = f"Added {image.name} ({w}x{h} {kind}) to {done} object(s)"
+        if raster["reprojected_from"]:
+            message += f", reprojected from {raster['reprojected_from']}"
         if skipped:
             message += f"; skipped {skipped} whose materials have no Principled BSDF"
         if unmapped and context.scene.geo_coord_settings.coordinate_space == "FLAT":

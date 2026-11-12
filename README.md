@@ -51,8 +51,11 @@ Rarely changed options are in collapsed sub-panels.
     - **Add GeoTIFF Layer** drapes a GeoTIFF over the selected objects
       (the reference globe if nothing is selected), on the globe or a flat
       map, by longitude/latitude. No UVs are needed. The GeoTIFF must be
-      north-up and in longitude/latitude; reproject other files first,
-      e.g. `gdalwarp -t_srs EPSG:4326 in.tif out.tif`. Each file becomes
+      north-up and in longitude/latitude. Reproject other files first,
+      e.g. `gdalwarp -t_srs EPSG:4326 in.tif out.tif`, or turn on
+      **Reproject to Lon/Lat** in the file browser's options to warp them
+      to EPSG:4326 in memory (fine for typical projected rasters; do
+      datum shifts and antimeridian or polar data outside Blender). Each file becomes
       a `GeoTIFF: <name>` layer in front of the material's Base Color, so
       layers stack and show what's below outside the raster and at
       nodata. Three-band files are used as color; single-band files keep
