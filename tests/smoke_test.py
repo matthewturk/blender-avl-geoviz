@@ -111,6 +111,50 @@ def pair_names_node_group():
     return f"{len(group.nodes)} nodes"
 
 
+def globe_flat_node_groups():
+    import math
+
+    module = sys.modules[PKG + ".country_wireframes"]
+    coll = bpy.data.collections.new("Smoke Globe")
+    bpy.context.scene.collection.children.link(coll)
+    module._create_reference_globe(coll, radius=10.0, resolution=16)
+    to_flat = bpy.data.node_groups["Geo Globe To Flat"]
+    to_globe = bpy.data.node_groups["Geo Flat To Globe"]
+
+    def xyz(lat, lon, r=10.0):
+        lat, lon = math.radians(lat), math.radians(lon)
+        return (r * math.cos(lat) * math.cos(lon), r * math.cos(lat) * math.sin(lon), r * math.sin(lat))
+
+    # A square on the globe, filled in flat space and put back on the globe.
+    curve = bpy.data.curves.new("SmokeRing", "CURVE")
+    curve.dimensions = "3D"
+    spline = curve.splines.new("POLY")
+    spline.points.add(3)
+    for point, (lat, lon) in zip(spline.points, [(38, -90), (38, -88), (40, -88), (40, -90)]):
+        point.co = (*xyz(lat, lon), 1.0)
+    spline.use_cyclic_u = True
+    obj = bpy.data.objects.new("SmokeRing", curve)
+    coll.objects.link(obj)
+    tree = bpy.data.node_groups.new("Smoke Fill On Globe", "GeometryNodeTree")
+    tree.is_modifier = True
+    tree.interface.new_socket(name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    tree.interface.new_socket(name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    group_in, group_out = tree.nodes.new("NodeGroupInput"), tree.nodes.new("NodeGroupOutput")
+    flat, fill, back = (tree.nodes.new(t) for t in ("GeometryNodeGroup", "GeometryNodeFillCurve", "GeometryNodeGroup"))
+    flat.node_tree, back.node_tree = to_flat, to_globe
+    for node in (flat, back):
+        node.inputs["Center Latitude"].default_value = math.radians(39)
+        node.inputs["Center Longitude"].default_value = math.radians(-89)
+    for a, b in ((group_in, flat), (flat, fill), (fill, back), (back, group_out)):
+        tree.links.new(a.outputs[0], b.inputs[0])
+    obj.modifiers.new("Fill", "NODES").node_group = tree
+    mesh = obj.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh()
+    radii = [v.co.length for v in mesh.vertices]
+    assert len(mesh.polygons) > 0, "fill made no faces"
+    assert max(abs(r - 10.0) for r in radii) < 1e-4, f"radius drifted: {min(radii)}..{max(radii)}"
+    return f"{len(mesh.polygons)} faces, all on the globe"
+
+
 def natural_earth():
     assert bpy.ops.object.refresh_geo_country_list() == {"FINISHED"}
     return f"{len(bpy.context.scene.country_wireframe_settings.country_items)} countries"
@@ -122,6 +166,7 @@ check("GeoJSON import", geojson_import)
 check("GPX import", gpx_import)
 check("constant-mass emission generator", emission_generator)
 check("pair-names node group (nodebpy)", pair_names_node_group)
+check("globe/flat node groups", globe_flat_node_groups)
 if NETWORK:
     check("Natural Earth country list (network)", natural_earth)
 

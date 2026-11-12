@@ -48,6 +48,15 @@ Rarely changed options are in collapsed sub-panels.
     one wireframe or curve object per feature, carrying its OSM tags. A
     raw Overpass query can be used instead under Advanced Query.
   - **Imagery**: Blue Marble or a raster file on the globe.
+  - **Flat-space node groups**: creating the reference globe also adds
+    two geometry-node groups, **Geo Globe To Flat** and **Geo Flat To
+    Globe**. Use them as nodes or as modifiers around operations that need
+    local Z = 0, such as Fill Curve on an imported polygon: Globe To Flat
+    → Fill Curve → Flat To Globe. Flat space is an equirectangular map
+    in globe units centered on Center Latitude/Longitude (set both groups
+    to the same values, near the feature), with height above the globe in
+    Z. Only points move, so subdivide or resample in flat space if large
+    faces need to follow the curve of the globe.
   - **GPX Import**: GPS tracks, routes and waypoints. Re-importing a file
     updates its objects in place.
 - **Local Flat Map**: builds a metric scene of the area, centered on it:
