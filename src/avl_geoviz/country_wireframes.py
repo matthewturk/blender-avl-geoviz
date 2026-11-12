@@ -969,108 +969,99 @@ def _archive_geojson_imports(root, imports_coll):
     return archived_name
 
 
+def _uv_sphere_arrays(radius, segments, rings):
+    """Vertices and faces of a UV sphere (same topology as Blender's UV
+    Sphere: a vertex at each pole, rings - 1 rings of `segments` vertices,
+    triangle fans at the poles), wound so normals point outward."""
+    import numpy as np
+
+    lat = np.radians(90.0 - 180.0 * np.arange(1, rings) / rings)
+    lon = np.radians(360.0 * np.arange(segments) / segments)
+    lat_g, lon_g = np.meshgrid(lat, lon, indexing="ij")
+    ring_verts = np.stack(
+        [np.cos(lat_g) * np.cos(lon_g), np.cos(lat_g) * np.sin(lon_g), np.sin(lat_g)],
+        axis=-1,
+    ).reshape(-1, 3)
+    # Poles exactly on the Z axis: the UV code below finds them by x == y == 0.
+    verts = np.vstack([[0.0, 0.0, 1.0], ring_verts, [0.0, 0.0, -1.0]]) * radius
+
+    def ring_vertex(i, j):  # ring i (0 = nearest the north pole), segment j
+        return 1 + i * segments + (j % segments)
+
+    bottom = len(verts) - 1
+    faces = []
+    for j in range(segments):
+        faces.append((0, ring_vertex(0, j), ring_vertex(0, j + 1)))
+    for i in range(rings - 2):
+        for j in range(segments):
+            faces.append((
+                ring_vertex(i, j), ring_vertex(i + 1, j),
+                ring_vertex(i + 1, j + 1), ring_vertex(i, j + 1),
+            ))
+    for j in range(segments):
+        faces.append((ring_vertex(rings - 2, j), bottom, ring_vertex(rings - 2, j + 1)))
+    return verts, faces
+
+
 def _build_sphere_mesh(
     mesh_name,
     radius,
     resolution,
     add_surface,
 ):
-    # Built via the primitive_uv_sphere_add operator rather than bmesh -
-    # bmesh has no compiled extension in the pip-installed `bpy` wheel
-    # (unlike a full Blender install/its bundled Python), only in a real
-    # Blender application - confirmed directly, see cli/HEADLESS.md. The
-    # operator needs an active collection/view layer, which always exists
-    # even fully headless with no GPU (confirmed directly too). Built into
-    # a throwaway object so the rest of this function can keep working
-    # purely on the resulting `mesh` datablock, exactly as before -
-    # everything below here (UV unwrap, pole/seam handling) only reads
-    # mesh.vertices/polygons/loops, with no assumption about how the mesh
-    # was constructed, just that it's a normal UV-sphere topology.
-    bpy.ops.mesh.primitive_uv_sphere_add(
-        segments=resolution,
-        ring_count=max(3, resolution // 2),
-        radius=radius,
-    )
-    temp_obj = bpy.context.active_object
-    mesh = temp_obj.data
-    mesh.name = mesh_name
-    bpy.data.objects.remove(temp_obj, do_unlink=True)
+    """UV sphere mesh with a GeoUV map matching _to_uv. Built from arrays
+    (not the primitive_uv_sphere_add operator) so it also works from a
+    property update callback, e.g. while dragging Globe Segments."""
+    import numpy as np
+
+    verts, faces = _uv_sphere_arrays(radius, resolution, max(3, resolution // 2))
+    mesh = bpy.data.meshes.new(mesh_name)
+    mesh.from_pydata(verts.tolist(), [], faces)
     mesh.update()
 
     uv_layer = mesh.uv_layers.new(name="GeoUV")
     if uv_layer is not None:
-        uv_data = uv_layer.data
-        loops = mesh.loops
-        vertices = mesh.vertices
+        co = np.empty(len(mesh.vertices) * 3)
+        mesh.vertices.foreach_get("co", co)
+        co = co.reshape(-1, 3)
+        loop_vertex = np.empty(len(mesh.loops), dtype=np.int64)
+        mesh.loops.foreach_get("vertex_index", loop_vertex)
+        starts = np.empty(len(mesh.polygons), dtype=np.int64)
+        mesh.polygons.foreach_get("loop_start", starts)
+        totals = np.empty(len(mesh.polygons), dtype=np.int64)
+        mesh.polygons.foreach_get("loop_total", totals)
 
-        # The two pole vertices sit exactly on the Z axis (x == y == 0.0,
-        # not just close to it - create_uvsphere puts them there exactly),
-        # so atan2(0, 0) is where every polar-cap triangle's apex loop
-        # lands - always the SAME longitude (0 degrees / u=0.5), regardless
-        # of which face is asking. That's unlike every other seam case
-        # here, which is a discontinuity a face can straddle; this is a
-        # constant that's simply wrong for most faces around the pole.
-        pole_vertex_indices = {
-            v.index for v in vertices if abs(v.co.x) < 1e-9 and abs(v.co.y) < 1e-9
-        }
+        lengths = np.maximum(np.linalg.norm(co, axis=1), 1e-8)
+        lat = np.degrees(np.arcsin(np.clip(co[:, 2] / lengths, -1.0, 1.0)))
+        lon = np.degrees(np.arctan2(co[:, 1], co[:, 0]))
+        u = ((lon + 180.0) / 360.0)[loop_vertex]
+        v = ((lat + 90.0) / 180.0)[loop_vertex]
 
-        for i, loop in enumerate(loops):
-            coord = vertices[loop.vertex_index].co
-            length = max(coord.length, 1e-8)
-            z_ratio = coord.z / length
-            z_ratio = max(-1.0, min(1.0, z_ratio))
-            lat = math.degrees(math.asin(z_ratio))
-            lon = math.degrees(math.atan2(coord.y, coord.x))
-            uv_data[i].uv = _to_uv(lat, lon)
+        # The pole vertices sit exactly on the Z axis, so atan2(0, 0) gives
+        # every polar-cap apex loop the same longitude regardless of face;
+        # they're handled separately below.
+        is_pole = ((np.abs(co[:, 0]) < 1e-9) & (np.abs(co[:, 1]) < 1e-9))[loop_vertex]
 
-        # atan2-based longitude has a discontinuity exactly at +-180 degrees
-        # (the antimeridian) - computed per-loop/per-vertex with no
-        # awareness of which face a loop belongs to, so a face straddling
-        # that seam (two geometrically adjacent vertices landing on
-        # opposite sides of it) gets some loops at u~0 and others at u~1,
-        # stretching the texture across the whole image width for that
-        # face - a real, visible zigzag along the seam. Fixed per-FACE (not
-        # per-vertex - a shared vertex needs different UV values depending
-        # on which face is asking, which is exactly why UVs live on loops,
-        # not vertices): any polygon whose loops span more than half the UV
-        # width gets its "low" loops pushed past 1.0, staying geometrically
-        # continuous with the "high" side instead of wrapping. Pole loops
-        # are excluded here - their constant u=0.5 isn't a real seam
-        # crossing, and including it would either mask a real wraparound
-        # face or trigger a shift the pole loop doesn't need.
-        for polygon in mesh.polygons:
-            non_pole_loops = [
-                li
-                for li in polygon.loop_indices
-                if loops[li].vertex_index not in pole_vertex_indices
-            ]
-            us = [uv_data[li].uv[0] for li in non_pole_loops]
-            if len(us) >= 2 and max(us) - min(us) > 0.5:
-                for li in non_pole_loops:
-                    u, v = uv_data[li].uv
-                    if u < 0.5:
-                        uv_data[li].uv = (u + 1.0, v)
+        # atan2 longitude jumps at +-180 degrees, so a face straddling the
+        # antimeridian gets some loops near u=0 and others near u=1, which
+        # stretches the texture across the whole image for that face. Fixed
+        # per face (UVs live on loops): in a face whose non-pole loops span
+        # more than half the width, push the low loops past 1.0.
+        u_max = np.maximum.reduceat(np.where(is_pole, -np.inf, u), starts)
+        u_min = np.minimum.reduceat(np.where(is_pole, np.inf, u), starts)
+        wraps = np.repeat((u_max - u_min) > 0.5, totals)
+        u = np.where(wraps & ~is_pole & (u < 0.5), u + 1.0, u)
 
-        # Now that every non-pole loop's u is seam-corrected, snap each
-        # polar-cap triangle's apex loop to match the longitude of its own
-        # base edge instead of the constant atan2(0, 0) value - this is
-        # what was pulling every polar triangle's texture toward one fixed
-        # meridian and produced the pinwheel crease down to the pole.
-        for polygon in mesh.polygons:
-            pole_loops = [
-                li
-                for li in polygon.loop_indices
-                if loops[li].vertex_index in pole_vertex_indices
-            ]
-            if not pole_loops:
-                continue
-            other_loops = [li for li in polygon.loop_indices if li not in pole_loops]
-            if not other_loops:
-                continue
-            avg_u = sum(uv_data[li].uv[0] for li in other_loops) / len(other_loops)
-            for li in pole_loops:
-                _, v = uv_data[li].uv
-                uv_data[li].uv = (avg_u, v)
+        # Snap each polar-cap apex loop to the mean u of its own face's
+        # other loops, instead of the constant atan2(0, 0) value that pulls
+        # every polar triangle's texture toward one meridian.
+        non_pole = (~is_pole).astype(float)
+        mean_u = np.add.reduceat(u * non_pole, starts) / np.maximum(
+            np.add.reduceat(non_pole, starts), 1.0
+        )
+        u = np.where(is_pole, np.repeat(mean_u, totals), u)
+
+        uv_layer.data.foreach_set("uv", np.stack([u, v], axis=1).ravel())
 
     if not add_surface:
         mesh.polygons.foreach_set("hide", [True] * len(mesh.polygons))
@@ -1955,8 +1946,7 @@ def _create_reference_globe(collection, radius, resolution, globe_root=None):
     obj["geo_iso2"] = ""
     obj["geo_iso3"] = ""
     obj["geo_m49"] = ""
-    for poly in mesh.polygons:
-        poly.use_smooth = True
+    mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
     collection.objects.link(obj)
     _parent_to_globe_root(obj, globe_root)
     # Node groups for running flat-space operations (Fill Curve, ...) on
@@ -1989,9 +1979,30 @@ def _ensure_reference_globe(context, settings):
     return _create_reference_globe(
         collection=reference_coll,
         radius=coord_settings.globe_radius,
-        resolution=settings.resolution,
+        resolution=settings.globe_segments,
         globe_root=globe_root,
     )
+
+
+def _rebuild_reference_globe(settings, context):
+    """Globe Segments update: rebuild the existing reference globe's mesh at
+    the new segment count, keeping its object, materials and transform."""
+    globe = _find_reference_globe_object()
+    if globe is None or globe.type != "MESH":
+        return
+    coord_settings = context.scene.geo_coord_settings
+    old = globe.data
+    mesh = _build_sphere_mesh(
+        "GeoReferenceGlobeMesh", coord_settings.globe_radius,
+        max(8, settings.globe_segments), add_surface=True,
+    )
+    store_lonlat_attributes(mesh, lonlat_mapping_props(None))
+    mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+    for material in old.materials:
+        mesh.materials.append(material)
+    globe.data = mesh
+    if old.users == 0:
+        bpy.data.meshes.remove(old)
 
 
 def _normalize_image_array(array):
@@ -2734,10 +2745,22 @@ class CountryWireframeSettings(bpy.types.PropertyGroup):
     )
     resolution: bpy.props.IntProperty(
         name="Resolution",
-        description="Segments for the generated UV spheres",
+        description="Segments for the country and continent marker spheres",
         default=24,
         min=6,
         max=256,
+    )
+    globe_segments: bpy.props.IntProperty(
+        name="Globe Segments",
+        description=(
+            "Segments around the reference globe (half as many rings). "
+            "Live: changing it rebuilds an existing globe"
+        ),
+        default=256,
+        min=8,
+        soft_max=512,
+        max=2048,
+        update=_rebuild_reference_globe,
     )
     marker_scale: bpy.props.FloatProperty(
         name="Country Scale",
@@ -3409,7 +3432,7 @@ class OBJECT_OT_create_country_wireframes(bpy.types.Operator):
             _create_reference_globe(
                 collection=reference_coll,
                 radius=coord_settings.globe_radius,
-                resolution=settings.resolution,
+                resolution=settings.globe_segments,
                 globe_root=globe_root,
             )
 
@@ -3766,6 +3789,7 @@ class VIEW3D_PT_country_wireframes_build_display(_AVLGISPanel, bpy.types.Panel):
 
         layout.prop(settings, "resolution")
         layout.prop(settings, "create_reference_globe")
+        layout.prop(settings, "globe_segments")
         layout.prop(settings, "add_surface_mesh")
         layout.prop(settings, "marker_scale")
         layout.prop(settings, "continent_scale")
@@ -3795,6 +3819,7 @@ class VIEW3D_PT_country_wireframes_geojson(_AVLGISPanel, bpy.types.Panel):
             "object.import_geojson_wireframes",
             icon="IMPORT",
         )
+        layout.operator("object.fill_geo_polygons", icon="MOD_FLUIDSIM")
 
 
 class VIEW3D_PT_country_wireframes_geojson_geometry(_AVLGISPanel, bpy.types.Panel):
@@ -3923,6 +3948,7 @@ class VIEW3D_PT_country_wireframes_imagery(_AVLGISPanel, bpy.types.Panel):
         if settings.imagery_quality == "CUSTOM":
             col.prop(settings, "imagery_blue_marble_url")
         col.prop(settings, "imagery_max_size")
+        col.prop(settings, "globe_segments")
 
         col = layout.column(align=True)
         col.scale_y = 1.3

@@ -414,19 +414,25 @@ def build_layer_group(image):
     the raster mixed over Color out, plus the raw Value and the Mask."""
     lonlat_group = ensure_lonlat_group()
     uv_group = ensure_raster_uv_group()
-    group = _new_group(LAYER_GROUP_PREFIX + image.name)
+    group = _current(LAYER_GROUP_PREFIX + image.name)
+    if group is not None:
+        # Re-adding the same file: rebuild only the inside. Clearing the
+        # interface would disconnect this layer in every material using it.
+        group.nodes.clear()
+    else:
+        group = _new_group(LAYER_GROUP_PREFIX + image.name)
+        iface = group.interface
+        color_in = iface.new_socket(name="Color", in_out="INPUT", socket_type="NodeSocketColor")
+        color_in.default_value = (0.8, 0.8, 0.8, 1.0)
+        opacity = iface.new_socket(name="Opacity", in_out="INPUT", socket_type="NodeSocketFloat")
+        opacity.default_value = 1.0
+        opacity.min_value = 0.0
+        opacity.max_value = 1.0
+        opacity.subtype = "FACTOR"
+        iface.new_socket(name="Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+        iface.new_socket(name="Value", in_out="OUTPUT", socket_type="NodeSocketFloat")
+        iface.new_socket(name="Mask", in_out="OUTPUT", socket_type="NodeSocketFloat")
     group.description = f"{image.name} draped by longitude/latitude"
-    iface = group.interface
-    color_in = iface.new_socket(name="Color", in_out="INPUT", socket_type="NodeSocketColor")
-    color_in.default_value = (0.8, 0.8, 0.8, 1.0)
-    opacity = iface.new_socket(name="Opacity", in_out="INPUT", socket_type="NodeSocketFloat")
-    opacity.default_value = 1.0
-    opacity.min_value = 0.0
-    opacity.max_value = 1.0
-    opacity.subtype = "FACTOR"
-    iface.new_socket(name="Color", in_out="OUTPUT", socket_type="NodeSocketColor")
-    iface.new_socket(name="Value", in_out="OUTPUT", socket_type="NodeSocketFloat")
-    iface.new_socket(name="Mask", in_out="OUTPUT", socket_type="NodeSocketFloat")
     nodes, links = group.nodes, group.links
 
     gin = nodes.new("NodeGroupInput")
@@ -703,6 +709,10 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
         layer = build_layer_group(image)
         done, skipped = apply_layer(targets, layer)
 
+        from .globe_flat_nodes import sync_fill_material
+
+        for obj in targets:
+            sync_fill_material(obj)
         no_faces, no_material = _faces_problems(context, targets)
         unmapped = sum(1 for o in targets if "geo_lonlat_flat" not in o)
         w, h = raster["size"]
@@ -718,23 +728,139 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
                 "placed as if on the globe"
             )
         if no_faces:
-            # Make sure the groups the message points at exist; they're
-            # otherwise only made with the reference globe.
-            from .globe_flat_nodes import ensure_globe_flat_node_groups
-
-            ensure_globe_flat_node_groups(context.scene.geo_coord_settings.globe_radius)
             message += (
                 f"; {len(no_faces)} object(s) have no faces, so it won't show on them "
-                "until they're filled (e.g. Geometry Nodes: Geo Globe To Flat -> "
-                "Fill Curve -> Set Material -> Geo Flat To Globe)"
+                "until they're filled: use Fill Polygons"
             )
         if no_material:
             message += (
                 f"; {len(no_material)} object(s) have faces with no material, e.g. "
-                "made by Fill Curve; add a Set Material node"
+                "made by Fill Curve; use Fill Polygons or add a Set Material node"
             )
         problems = skipped or unmapped or no_faces or no_material
         self.report({"WARNING"} if problems else {"INFO"}, message)
+        return {"FINISHED"}
+
+
+def build_extent_object(context, name, path, bounds):
+    """A mesh covering the raster's bounds in the scene's space: a lat/lon
+    grid on the globe (as fine as the reference globe's Globe Segments) or a
+    single quad on a flat map (every flat projection is affine). Re-importing
+    the same file replaces the mesh of the object it made before."""
+    import math
+
+    import numpy as np
+
+    from .country_wireframes import (
+        _ensure_globe_overlay_root_empty,
+        _get_or_create_collection,
+        _parent_to_globe_root,
+    )
+    from .geo_coord import (
+        lonlat_mapping_props,
+        project_point,
+        stamp_lonlat_mapping,
+        store_lonlat_attributes,
+    )
+
+    cs = context.scene.geo_coord_settings
+    west, south, east, north = bounds
+    is_globe = cs.coordinate_space == "GLOBE"
+    if is_globe:
+        step = 360.0 / max(8, context.scene.country_wireframe_settings.globe_segments)
+        nx = max(1, min(2048, math.ceil((east - west) / step)))
+        ny = max(1, min(1024, math.ceil((north - south) / step)))
+    else:
+        nx = ny = 1
+    lons = np.linspace(west, east, nx + 1)
+    lats = np.linspace(south, north, ny + 1)
+    verts = [
+        project_point(lat, lon, 0.0, cs, bounds=bounds, radius=cs.globe_radius)
+        for lat in lats for lon in lons
+    ]
+    row = nx + 1
+    # West-to-east, south-to-north: counter-clockwise seen from outside the
+    # globe or from above a flat map, so normals face the viewer.
+    faces = [
+        (j * row + i, j * row + i + 1, (j + 1) * row + i + 1, (j + 1) * row + i)
+        for j in range(ny) for i in range(nx)
+    ]
+    mesh = bpy.data.meshes.new(f"GeoTIFF_{name}_Mesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    if is_globe:
+        mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
+    store_lonlat_attributes(mesh, lonlat_mapping_props(cs, bounds))
+
+    obj = next((o for o in bpy.data.objects
+                if o.get("geo_kind") == "geotiff_extent" and o.get("geo_source_file") == path), None)
+    if obj is None:
+        obj = bpy.data.objects.new(f"GeoTIFF_{name}", mesh)
+        root = _get_or_create_collection(context.scene.collection, "Geo Wireframes")
+        _get_or_create_collection(root, "GeoTIFF Extents").objects.link(obj)
+    else:
+        old = obj.data
+        for material in old.materials:
+            mesh.materials.append(material)
+        obj.data = mesh
+        if old.users == 0:
+            bpy.data.meshes.remove(old)
+    obj["geo_kind"] = "geotiff_extent"
+    obj["geo_name"] = name
+    obj["geo_source_file"] = path
+    stamp_lonlat_mapping(obj, cs, bounds)
+    _parent_to_globe_root(obj, _ensure_globe_overlay_root_empty(context))
+    return obj
+
+
+class OBJECT_OT_import_geotiff_extent(bpy.types.Operator, ImportHelper):
+    bl_idname = "object.import_geotiff_extent"
+    bl_label = "Import GeoTIFF as Object"
+    bl_description = (
+        "Make a new object covering a longitude/latitude GeoTIFF's extent, on "
+        "the globe or flat map, with the GeoTIFF as its layer"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    filename_ext = ".tif"
+    filter_glob: bpy.props.StringProperty(default="*.tif;*.tiff", options={"HIDDEN"})
+    reproject: OBJECT_OT_add_geotiff_layer.__annotations__["reproject"]
+    max_size: OBJECT_OT_add_geotiff_layer.__annotations__["max_size"]
+
+    def execute(self, context):
+        try:
+            raster = read_geotiff(self.filepath, self.max_size, self.reproject)
+        except GeoTiffError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        except Exception as exc:
+            self.report({"ERROR"}, f"Couldn't read {os.path.basename(self.filepath)}: {exc}")
+            return {"CANCELLED"}
+
+        name = os.path.splitext(os.path.basename(self.filepath))[0]
+        image = _image_from_raster(name, self.filepath, raster)
+        layer = build_layer_group(image)
+        obj = build_extent_object(context, name, self.filepath, raster["bounds"])
+        if not any(obj.data.materials):
+            material = bpy.data.materials.get(f"GeoTIFF {name}") or bpy.data.materials.new(f"GeoTIFF {name}")
+            if material.node_tree is None:
+                material.use_nodes = True
+            obj.data.materials.clear()
+            obj.data.materials.append(material)
+        for material in obj.data.materials:
+            add_layer_to_material(material, layer)
+
+        for other in context.selected_objects:
+            other.select_set(False)
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+        west, south, east, north = raster["bounds"]
+        message = (
+            f"Made {obj.name} covering {west:.4f}..{east:.4f} E, {south:.4f}..{north:.4f} N"
+        )
+        if raster["reprojected_from"]:
+            message += f" (reprojected from {raster['reprojected_from']})"
+        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -805,7 +931,10 @@ class VIEW3D_PT_geotiff_layers(_AVLGISPanel, bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.operator("object.add_geotiff_layer", icon="IMAGE_RGB_ALPHA")
+        col = layout.column(align=True)
+        col.operator("object.add_geotiff_layer", icon="IMAGE_RGB_ALPHA")
+        col.operator("object.import_geotiff_extent", icon="MESH_GRID")
+        col.operator("object.fill_geo_polygons", icon="MOD_FLUIDSIM")
         obj = _layer_object(context)
         materials = [m for m in getattr(getattr(obj, "data", None), "materials", None) or [] if m]
         chains = [(m, layer_chain(m)) for m in materials]
@@ -843,6 +972,7 @@ class VIEW3D_PT_geotiff_layers(_AVLGISPanel, bpy.types.Panel):
 
 CLASSES = (
     OBJECT_OT_add_geotiff_layer,
+    OBJECT_OT_import_geotiff_extent,
     OBJECT_OT_geotiff_layer_move,
     OBJECT_OT_geotiff_layer_remove,
     VIEW3D_PT_geotiff_layers,
