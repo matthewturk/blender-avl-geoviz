@@ -277,3 +277,227 @@ def ensure_globe_flat_node_groups(radius):
             group.interface.items_tree["Radius"].default_value = radius
         groups.append(group)
     return tuple(groups)
+
+
+# ---------------------------------------------------------------------------
+#  Fill Polygons
+# ---------------------------------------------------------------------------
+
+FILL_GROUP_NAME = "Geo Fill Polygons"
+FILL_MODIFIER_NAME = "Geo Fill Polygons"
+_FILL_VERSION = 1
+
+# Flat-space subdivision targets edges of about this many degrees, so filled
+# globe polygons follow the sphere instead of cutting through it.
+_FILL_TARGET_DEG = 2.0
+_FILL_MAX_LEVEL = 6
+
+
+def ensure_fill_group(radius):
+    """Geo Fill Polygons: outline curves (or wire meshes) in, faces out.
+
+    Globe: Globe To Flat -> Fill Curve -> Subdivide Mesh -> Flat To Globe.
+    Flat: Fill Curve. Then Set Material, since Fill Curve's output has no
+    material otherwise.
+    """
+    to_flat, to_globe = ensure_globe_flat_node_groups(radius)
+    group = bpy.data.node_groups.get(FILL_GROUP_NAME)
+    if (
+        group is not None
+        and group.bl_idname == "GeometryNodeTree"
+        and group.get(_VERSION_KEY) == _FILL_VERSION
+    ):
+        return group
+    group = _reset_group(FILL_GROUP_NAME)
+    group[_VERSION_KEY] = _FILL_VERSION
+    group.description = "Fill imported polygon outlines with faces, on the globe or a flat map"
+    _new_socket(group, "Geometry", "INPUT", "NodeSocketGeometry")
+    _new_socket(group, "Globe", "INPUT", "NodeSocketBool", default=True,
+                description="Fill in flat space around the center and put the faces back on the globe")
+    _new_socket(group, "Radius", "INPUT", "NodeSocketFloat", default=radius, subtype="DISTANCE")
+    _new_socket(group, "Center Latitude", "INPUT", "NodeSocketFloat", default=0.0, subtype="ANGLE")
+    _new_socket(group, "Center Longitude", "INPUT", "NodeSocketFloat", default=0.0, subtype="ANGLE")
+    sub = _new_socket(group, "Subdivisions", "INPUT", "NodeSocketInt", default=0,
+                      description="Subdivide the faces in flat space so large ones follow the globe")
+    sub.min_value, sub.max_value = 0, 8
+    _new_socket(group, "Material", "INPUT", "NodeSocketMaterial")
+    _new_socket(group, "Keep Outline", "INPUT", "NodeSocketBool", default=False)
+    _new_socket(group, "Geometry", "OUTPUT", "NodeSocketGeometry")
+    nodes, links = group.nodes, group.links
+
+    gin = nodes.new("NodeGroupInput")
+    gin.location = (-1400, 0)
+    # Wire meshes become curves; curves pass through.
+    to_curve = nodes.new("GeometryNodeMeshToCurve")
+    to_curve.location = (-1200, 100)
+    links.new(gin.outputs["Geometry"], to_curve.inputs["Mesh"])
+    outlines = nodes.new("GeometryNodeJoinGeometry")
+    outlines.location = (-1000, 0)
+    links.new(gin.outputs["Geometry"], outlines.inputs[0])
+    links.new(to_curve.outputs["Curve"], outlines.inputs[0])
+
+    flat = nodes.new("GeometryNodeGroup")
+    flat.node_tree = to_flat
+    flat.location = (-800, 200)
+    back = nodes.new("GeometryNodeGroup")
+    back.node_tree = to_globe
+    back.location = (-200, 200)
+    for node in (flat, back):
+        for name in ("Radius", "Center Latitude", "Center Longitude"):
+            links.new(gin.outputs[name], node.inputs[name])
+    links.new(outlines.outputs[0], flat.inputs["Geometry"])
+    fill_globe = nodes.new("GeometryNodeFillCurve")
+    fill_globe.location = (-600, 200)
+    links.new(flat.outputs["Geometry"], fill_globe.inputs["Curve"])
+    subdivide = nodes.new("GeometryNodeSubdivideMesh")
+    subdivide.location = (-400, 200)
+    links.new(fill_globe.outputs["Mesh"], subdivide.inputs["Mesh"])
+    links.new(gin.outputs["Subdivisions"], subdivide.inputs["Level"])
+    links.new(subdivide.outputs["Mesh"], back.inputs["Geometry"])
+
+    fill_flat = nodes.new("GeometryNodeFillCurve")
+    fill_flat.location = (-400, -100)
+    links.new(outlines.outputs[0], fill_flat.inputs["Curve"])
+
+    space = nodes.new("GeometryNodeSwitch")
+    space.input_type = "GEOMETRY"
+    space.location = (0, 0)
+    links.new(gin.outputs["Globe"], space.inputs["Switch"])
+    links.new(fill_flat.outputs["Mesh"], space.inputs["False"])
+    links.new(back.outputs["Geometry"], space.inputs["True"])
+
+    material = nodes.new("GeometryNodeSetMaterial")
+    material.location = (200, 0)
+    links.new(space.outputs[0], material.inputs["Geometry"])
+    links.new(gin.outputs["Material"], material.inputs["Material"])
+
+    with_outline = nodes.new("GeometryNodeJoinGeometry")
+    with_outline.location = (400, -150)
+    links.new(material.outputs["Geometry"], with_outline.inputs[0])
+    links.new(gin.outputs["Geometry"], with_outline.inputs[0])
+    keep = nodes.new("GeometryNodeSwitch")
+    keep.input_type = "GEOMETRY"
+    keep.location = (600, 0)
+    links.new(gin.outputs["Keep Outline"], keep.inputs["Switch"])
+    links.new(material.outputs["Geometry"], keep.inputs["False"])
+    links.new(with_outline.outputs[0], keep.inputs["True"])
+
+    gout = nodes.new("NodeGroupOutput")
+    gout.location = (800, 0)
+    links.new(keep.outputs[0], gout.inputs["Geometry"])
+    return group
+
+
+def _outline_points(obj):
+    """Object-local points of a mesh's vertices or a curve's control points."""
+    import numpy as np
+
+    if obj.type == "MESH":
+        co = np.empty(len(obj.data.vertices) * 3)
+        obj.data.vertices.foreach_get("co", co)
+        return co.reshape(-1, 3)
+    points = []
+    for spline in obj.data.splines:
+        if spline.type == "BEZIER":
+            points.extend(tuple(p.co) for p in spline.bezier_points)
+        else:
+            points.extend(tuple(p.co)[:3] for p in spline.points)
+    return np.array(points, dtype=float).reshape(-1, 3)
+
+
+def fill_settings(obj, scene):
+    """Modifier inputs for filling *obj*: whether it's on the globe, and
+    for globe objects the center (radians) and a subdivision level from its
+    angular size."""
+    import math
+
+    import numpy as np
+
+    flat = obj.get("geo_lonlat_flat")
+    is_globe = (not flat) if flat is not None else scene.geo_coord_settings.coordinate_space == "GLOBE"
+    values = {"Globe": is_globe, "Radius": scene.geo_coord_settings.globe_radius,
+              "Center Latitude": 0.0, "Center Longitude": 0.0, "Subdivisions": 0}
+    points = _outline_points(obj)
+    if not is_globe or len(points) == 0:
+        return values
+    units = points / np.maximum(np.linalg.norm(points, axis=1, keepdims=True), 1e-12)
+    center = units.mean(axis=0)
+    norm = np.linalg.norm(center)
+    if norm < 1e-9:
+        return values
+    center /= norm
+    values["Center Latitude"] = math.asin(max(-1.0, min(1.0, center[2])))
+    values["Center Longitude"] = math.atan2(center[1], center[0])
+    radius_deg = math.degrees(math.acos(max(-1.0, min(1.0, float((units @ center).min())))))
+    span = 2.0 * radius_deg
+    if span > _FILL_TARGET_DEG:
+        values["Subdivisions"] = min(_FILL_MAX_LEVEL, math.ceil(math.log2(span / _FILL_TARGET_DEG)))
+    return values
+
+
+def _first_material(obj):
+    data = getattr(obj, "data", None)
+    for material in getattr(data, "materials", None) or []:
+        if material is not None:
+            return material
+    return None
+
+
+def sync_fill_material(obj):
+    """Point an object's Fill Polygons modifier at its first material (e.g.
+    after Add GeoTIFF Layer gave it one)."""
+    from .country_wireframes import _apply_node_group_input_defaults
+
+    material = _first_material(obj)
+    if material is None:
+        return
+    for mod in obj.modifiers:
+        if mod.type == "NODES" and mod.node_group is not None and mod.node_group.name == FILL_GROUP_NAME:
+            _apply_node_group_input_defaults(mod, mod.node_group, {"Material": material})
+
+
+class OBJECT_OT_fill_geo_polygons(bpy.types.Operator):
+    bl_idname = "object.fill_geo_polygons"
+    bl_label = "Fill Polygons"
+    bl_description = (
+        "Give the selected polygon outlines (imported curves or wireframes) "
+        "faces, on the globe or a flat map, with a Geo Fill Polygons modifier"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return any(o.type in {"CURVE", "MESH"} for o in context.selected_objects)
+
+    def execute(self, context):
+        from .country_wireframes import _apply_node_group_input_defaults
+
+        group = ensure_fill_group(context.scene.geo_coord_settings.globe_radius)
+        count = 0
+        for obj in context.selected_objects:
+            if obj.type not in {"CURVE", "MESH"}:
+                continue
+            mod = obj.modifiers.get(FILL_MODIFIER_NAME)
+            if mod is None or mod.type != "NODES":
+                mod = obj.modifiers.new(FILL_MODIFIER_NAME, "NODES")
+            mod.node_group = group
+            values = fill_settings(obj, context.scene)
+            values["Material"] = _first_material(obj)
+            _apply_node_group_input_defaults(mod, group, values)
+            obj.update_tag()
+            count += 1
+        self.report({"INFO"}, f"Filled {count} object(s)")
+        return {"FINISHED"}
+
+
+CLASSES = (OBJECT_OT_fill_geo_polygons,)
+
+
+def register():
+    for cls in CLASSES:
+        bpy.utils.register_class(cls)
+
+
+def unregister():
+    for cls in reversed(CLASSES):
+        bpy.utils.unregister_class(cls)

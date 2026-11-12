@@ -155,6 +155,82 @@ def globe_flat_node_groups():
     return f"{len(mesh.polygons)} faces, all on the globe"
 
 
+def geotiff_layer():
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    def tif(crs, bounds):
+        fd, path = tempfile.mkstemp(suffix=".tif")
+        os.close(fd)
+        with rasterio.open(path, "w", driver="GTiff", width=8, height=8, count=3, dtype="uint8",
+                           crs=crs, transform=from_bounds(*bounds, 8, 8)) as dst:
+            dst.write(np.full((3, 8, 8), 200, np.uint8))
+        return path
+
+    for obj in bpy.context.selected_objects:
+        obj.select_set(False)
+    path = tif("EPSG:4326", (-100, 30, -80, 50))
+    assert bpy.ops.object.add_geotiff_layer(filepath=path) == {"FINISHED"}
+    name = os.path.splitext(os.path.basename(path))[0]
+    image = bpy.data.images[name]
+    assert image.packed_file is not None, "image isn't packed"
+    assert tuple(image["geo_bounds"]) == (-100, 30, -80, 50), tuple(image["geo_bounds"])
+    globe = bpy.data.objects["GeoReferenceGlobe"]
+    layers = [n for m in globe.data.materials for n in m.node_tree.nodes
+              if n.bl_idname == "ShaderNodeGroup" and n.node_tree.name == "GeoTIFF: " + name]
+    assert layers, "layer not added to the reference globe"
+    # Projected rasters are refused unless reprojecting is turned on.
+    utm = tif("EPSG:32616", (3e5, 4e6, 4e5, 4.1e6))
+    try:
+        bpy.ops.object.add_geotiff_layer(filepath=utm)
+        raise AssertionError("projected raster was accepted")
+    except RuntimeError as exc:
+        assert "Reproject" in str(exc), exc
+    assert bpy.ops.object.add_geotiff_layer(filepath=utm, reproject=True) == {"FINISHED"}
+    warped = bpy.data.images[os.path.splitext(os.path.basename(utm))[0]]
+    assert warped["geo_reprojected_from"] == "EPSG:32616", warped.get("geo_reprojected_from")
+    return (f"{image.size[0]}x{image.size[1]} layer on the reference globe; projected raster "
+            "refused, then reprojected when asked")
+
+
+def fill_extent_segments():
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    path = write(".geojson", json.dumps({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"name": "fill_me"},
+         "geometry": {"type": "Polygon", "coordinates": [[[-90, 38], [-80, 38], [-80, 45], [-85, 41], [-90, 45], [-90, 38]]]}}]}))
+    before = set(bpy.data.objects)
+    assert bpy.ops.object.import_geojson_wireframes(filepath=path) == {"FINISHED"}
+    outline = next(o for o in bpy.data.objects if o not in before and o.get("geo_name") == "fill_me")
+    for obj in bpy.context.selected_objects:
+        obj.select_set(False)
+    outline.select_set(True)
+    assert bpy.ops.object.fill_geo_polygons() == {"FINISHED"}
+    filled = outline.evaluated_get(bpy.context.evaluated_depsgraph_get()).to_mesh()
+    faces = len(filled.polygons)
+    assert faces > 0, "Fill Polygons made no faces"
+
+    fd, tif = tempfile.mkstemp(suffix=".tif")
+    os.close(fd)
+    with rasterio.open(tif, "w", driver="GTiff", width=4, height=4, count=1, dtype="float32",
+                       crs="EPSG:4326", transform=from_bounds(-90, 38, -80, 45, 4, 4)) as dst:
+        dst.write(np.arange(16, dtype="float32").reshape(1, 4, 4))
+    assert bpy.ops.object.import_geotiff_extent(filepath=tif) == {"FINISHED"}
+    extent = bpy.context.active_object
+    assert extent.get("geo_kind") == "geotiff_extent" and len(extent.data.polygons) > 0
+
+    settings = bpy.context.scene.country_wireframe_settings
+    globe = bpy.data.objects["GeoReferenceGlobe"]
+    settings.globe_segments = 32
+    assert len(globe.data.vertices) == 32 * 15 + 2, len(globe.data.vertices)
+    settings.globe_segments = 256
+    return (f"{faces} filled faces; extent object {extent.name}; globe rebuilt at 32 then "
+            f"{len(globe.data.vertices)} vertices")
+
+
 def natural_earth():
     assert bpy.ops.object.refresh_geo_country_list() == {"FINISHED"}
     return f"{len(bpy.context.scene.country_wireframe_settings.country_items)} countries"
@@ -167,6 +243,8 @@ check("GPX import", gpx_import)
 check("constant-mass emission generator", emission_generator)
 check("pair-names node group (nodebpy)", pair_names_node_group)
 check("globe/flat node groups", globe_flat_node_groups)
+check("GeoTIFF layer", geotiff_layer)
+check("Fill Polygons, GeoTIFF extent, Globe Segments", fill_extent_segments)
 if NETWORK:
     check("Natural Earth country list (network)", natural_earth)
 

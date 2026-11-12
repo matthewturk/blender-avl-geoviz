@@ -8,7 +8,7 @@ import bpy
 from bpy_extras.io_utils import ImportHelper
 
 from . import geo_coord
-from .geo_coord import project_point
+from .geo_coord import lonlat_mapping_props, project_point, store_lonlat_attributes
 
 try:
     from gpx import read_gpx
@@ -217,6 +217,7 @@ def _track_mesh(name, track, coord_settings, bounds=None):
                 v = row.get(key)
                 attr.data[i].value = str(v).encode("utf-8") if v is not None else b""
 
+    store_lonlat_attributes(mesh, lonlat_mapping_props(coord_settings, bounds))
     return mesh
 
 
@@ -283,6 +284,7 @@ def _wpt_mesh(name, waypoints, coord_settings, bounds=None):
                 v = row.get(key)
                 attr.data[i].value = str(v).encode("utf-8") if v is not None else b""
 
+    store_lonlat_attributes(mesh, lonlat_mapping_props(coord_settings, bounds))
     return mesh
 
 
@@ -443,6 +445,11 @@ def _do_import(context, filepath, settings):
             "display_type": "SOLID",
             "props": {"gpx_source_file": filepath},
         })
+
+    # GPX objects sit at the origin, unparented, so the mapping applies as is.
+    mapping = lonlat_mapping_props(coord_settings, bounds)
+    for item in track_items + wpt_items:
+        item["props"].update(mapping)
 
     track_count = len(_reconcile(tracks_coll, track_items))
     _reconcile(wpts_coll, wpt_items)

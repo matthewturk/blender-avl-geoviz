@@ -8,6 +8,7 @@ from io import BytesIO
 
 import bpy
 
+from .geo_coord import store_lonlat_attributes
 from . import _osm_safety_shared, osm_area
 
 # --- Library Check Helpers ---
@@ -792,6 +793,7 @@ def create_mesh_from_polygons(polygons_list, name):
 # --- Unified Core Import Pipeline ---
 
 def import_flat_gis_geojson_data(context, geojson_data, settings, bbox_bounds=None, warnings=None):
+    objects_before = set(bpy.data.objects)
     # Determine reference bounds
     if bbox_bounds:
         min_lat, min_lon, max_lat, max_lon = bbox_bounds
@@ -1171,6 +1173,26 @@ def import_flat_gis_geojson_data(context, geojson_data, settings, bbox_bounds=No
             set_geonode_modifier_input(mod, geonode_tree, "Instance Object", default_marker_obj)
             set_geonode_modifier_input(mod, geonode_tree, "Scale", 1.0)
             
+    # Let the Geo LonLat shader group (geo_raster.py) map these objects'
+    # local meters back to lon/lat: x = (lon - ref_lon) * lon_to_meters.
+    mapping = {
+        "geo_lonlat_flat": 1.0,
+        "geo_lonlat_scale": (lon_to_meters, lat_to_meters, 1.0),
+        "geo_lonlat_offset": (-ref_lon * lon_to_meters, -ref_lat * lat_to_meters, 0.0),
+    }
+    for obj in set(bpy.data.objects) - objects_before:
+        obj["geo_lonlat_flat"] = 1.0
+        obj["geo_lonlat_scale"] = mapping["geo_lonlat_scale"]
+        obj["geo_lonlat_offset"] = (
+            mapping["geo_lonlat_offset"][0] - obj.location.x,
+            mapping["geo_lonlat_offset"][1] - obj.location.y,
+            0.0,
+        )
+        # Per-point geo_lon/geo_lat on the source geometry; the visible
+        # objects' Geometry Nodes carry them over from it.
+        if obj.name.startswith("Shadow_") and hasattr(obj.data, "attributes"):
+            store_lonlat_attributes(obj.data, mapping)
+
     # Force viewport update and redraw the UI region immediately
     bpy.context.view_layer.update()
     for window in bpy.context.window_manager.windows:
