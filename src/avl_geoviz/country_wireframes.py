@@ -20,6 +20,9 @@ from .geo_coord import (
     latlon_to_xy_with_bounds,
     latlon_to_xyz,
     project_point,
+    lonlat_mapping_props,
+    stamp_lonlat_mapping,
+    store_lonlat_attributes,
 )
 
 # NASA Visible Earth "Blue Marble Next Generation" (Dec. 2004), cloud-free.
@@ -1368,6 +1371,7 @@ def _create_boundary_wire_object_from_lines(
     obj = bpy.data.objects.new(obj_name, mesh)
     obj.display_type = "WIRE"
     _set_geo_identity(obj, kind, geo_name, continent_name, iso2, iso3, m49)
+    stamp_lonlat_mapping(obj, coord_settings, latlon_bounds)
     collection.objects.link(obj)
     _parent_to_globe_root(obj, globe_root)
     return obj
@@ -1428,6 +1432,7 @@ def _boundary_wire_mesh(
     # reachable from inside a node tree, only real geometry attributes are.
     m49_attr = mesh.attributes.new(name="geo_m49", type="INT", domain="POINT")
     m49_attr.data.foreach_set("value", [int(m49) if m49 else -1] * len(vertices))
+    store_lonlat_attributes(mesh, lonlat_mapping_props(coord_settings, latlon_bounds))
     return mesh
 
 
@@ -1508,6 +1513,7 @@ def _create_curve_outline_object_from_lines(
     obj["geo_iso2"] = iso2
     obj["geo_iso3"] = iso3
     obj["geo_m49"] = m49
+    stamp_lonlat_mapping(obj, coord_settings, latlon_bounds)
     collection.objects.link(obj)
     _parent_to_globe_root(obj, globe_root)
     return obj
@@ -1763,6 +1769,7 @@ def _import_geojson_feature_payload(
             point_obj["geo_point_index"] = point_index
             point_obj["geo_lon"] = lon
             point_obj["geo_lat"] = lat
+            stamp_lonlat_mapping(point_obj, coord_settings, latlon_bounds)
             for key, value in properties.items():
                 if value is not None:
                     point_obj[f"osm:{key}"] = _safe_custom_property_value(value)
@@ -1939,6 +1946,7 @@ def _create_reference_globe(collection, radius, resolution, globe_root=None):
         max(8, resolution),
         add_surface=True,
     )
+    store_lonlat_attributes(mesh, lonlat_mapping_props(None))
     obj = bpy.data.objects.new("GeoReferenceGlobe", mesh)
     obj.display_type = "SOLID"
     obj["geo_kind"] = "reference_globe"
@@ -2251,7 +2259,10 @@ def _sync_country_items_from_world(settings, world):
         item.selected = bool(selected_by_name.get(name, False))
 
 
-def _reconcile_geo_markers(collection, prefix, items, remove_stale, globe_root=None):
+def _reconcile_geo_markers(
+    collection, prefix, items, remove_stale, globe_root=None,
+    coord_settings=None, latlon_bounds=None,
+):
     """Create, update or remove one marker object per item in `collection`.
 
     Uses d3blender's data().join(), keyed by the item's geo name, so re-running
@@ -2312,6 +2323,10 @@ def _reconcile_geo_markers(collection, prefix, items, remove_stale, globe_root=N
             item["iso3"],
             item["m49"],
         )
+        if "lon" in item:
+            obj["geo_lon"] = item["lon"]
+            obj["geo_lat"] = item["lat"]
+        stamp_lonlat_mapping(obj, coord_settings, latlon_bounds)
         _parent_to_globe_root(obj, globe_root)
     return duplicates
 
@@ -3481,6 +3496,8 @@ class OBJECT_OT_create_country_wireframes(bpy.types.Operator):
                         "name": name,
                         "mesh": mesh,
                         "location": (0.0, 0.0, 0.0) if boundary_mode else location,
+                        "lon": lon,
+                        "lat": lat,
                         "kind": "country",
                         "continent": continent_name,
                         "iso2": iso2,
@@ -3534,6 +3551,8 @@ class OBJECT_OT_create_country_wireframes(bpy.types.Operator):
                         "name": continent_name,
                         "mesh": mesh,
                         "location": (0.0, 0.0, 0.0) if boundary_mode else location,
+                        "lon": lon,
+                        "lat": lat,
                         "kind": "continent",
                         "continent": continent_name,
                         "iso2": "",
@@ -3564,7 +3583,8 @@ class OBJECT_OT_create_country_wireframes(bpy.types.Operator):
             # A disabled kind reconciles against no items: cleared when Clear
             # Existing is on, left alone otherwise (as before).
             duplicates += _reconcile_geo_markers(
-                coll, prefix, markers, settings.clear_existing, overlay_root
+                coll, prefix, markers, settings.clear_existing, overlay_root,
+                coord_settings=coord_settings, latlon_bounds=latlon_bounds,
             )
         if duplicates:
             print(
@@ -3913,6 +3933,10 @@ class VIEW3D_PT_country_wireframes_imagery(_AVLGISPanel, bpy.types.Panel):
         layout.operator(
             "object.apply_texture_from_raster",
             icon="FILE_IMAGE",
+        )
+        layout.operator(
+            "object.add_geotiff_layer",
+            icon="IMAGE_RGB_ALPHA",
         )
 
 

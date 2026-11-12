@@ -48,6 +48,25 @@ Rarely changed options are in collapsed sub-panels.
     one wireframe or curve object per feature, carrying its OSM tags. A
     raw Overpass query can be used instead under Advanced Query.
   - **Imagery**: Blue Marble or a raster file on the globe.
+    - **Add GeoTIFF Layer** drapes a GeoTIFF over the selected objects
+      (the reference globe if nothing is selected), on the globe or a flat
+      map, by longitude/latitude. No UVs are needed. The GeoTIFF must be
+      north-up and in longitude/latitude; reproject other files first,
+      e.g. `gdalwarp -t_srs EPSG:4326 in.tif out.tif`. Each file becomes
+      a `GeoTIFF: <name>` layer in front of the material's Base Color, so
+      layers stack and show what's below outside the raster and at
+      nodata. Three-band files are used as color; single-band files keep
+      their raw values (the layer's Value output) and are colored with an
+      editable color ramp. Flat objects only line up if they came from
+      one of the importers here, which store each object's map mapping on
+      it.
+  - **Longitude/latitude on imports**: meshes made by the importers here
+    (GeoJSON/OSM wireframes, country boundaries, GPX, the Local Flat Map's
+    source geometry and the reference globe) have per-point `geo_lon` and
+    `geo_lat` attributes in degrees, for Named Attribute in Geometry Nodes
+    or an Attribute node in shaders. Point markers have them as object
+    properties. Curve-mode imports can't hold attributes, but like every
+    import they carry the per-object mapping Add GeoTIFF Layer uses.
   - **Flat-space node groups**: creating the reference globe also adds
     two geometry-node groups, **Geo Globe To Flat** and **Geo Flat To
     Globe**. Use them as nodes or as modifiers around operations that need

@@ -193,6 +193,79 @@ def project_point(
     return (x, y, ele * settings.flat_scale * 0.001)
 
 
+def lonlat_mapping_props(settings, bounds=None):
+    """Custom properties telling the Geo LonLat shader group (geo_raster.py)
+    how to get longitude/latitude back from an object's local coordinates.
+
+    Globe objects need nothing but the flag: lon/lat come from the direction
+    of the local position. Every flat projection is axis-aligned and affine
+    in lon/lat (x depends only on lon, y only on lat), so three projected
+    points give its scale and offset: local xy = scale * (lon, lat) + offset.
+    """
+    if settings is None or settings.coordinate_space == "GLOBE":
+        return {"geo_lonlat_flat": 0.0}
+    x0, y0, _ = flat_project(0.0, 0.0, settings, bounds)
+    x1, _, _ = flat_project(0.0, 1.0, settings, bounds)
+    _, y1, _ = flat_project(1.0, 0.0, settings, bounds)
+    return {
+        "geo_lonlat_flat": 1.0,
+        "geo_lonlat_scale": (x1 - x0, y1 - y0, 1.0),
+        "geo_lonlat_offset": (x0, y0, 0.0),
+    }
+
+
+def store_lonlat_attributes(data, mapping):
+    """Give mesh or (hair) curves *data* POINT attributes geo_lon and geo_lat
+    (degrees) for every point, computed from its position with *mapping*
+    (a lonlat_mapping_props dict), so Geometry Nodes and shaders can read
+    lon/lat directly with Named Attribute / Attribute nodes.
+
+    Computed from positions rather than from source coordinates so they're
+    right for the points importers add or remove (great-circle densifying,
+    simplifying). Float32, like positions: about 1 m near 90 deg longitude.
+    """
+    import numpy as np
+
+    position = data.attributes.get("position")
+    count = len(position.data) if position is not None else 0
+    if count == 0:
+        return
+    pos = np.empty(count * 3, dtype=np.float32)
+    position.data.foreach_get("vector", pos)
+    x, y, z = pos.reshape(-1, 3).astype(np.float64).T
+    if mapping.get("geo_lonlat_flat"):
+        sx, sy, _ = mapping["geo_lonlat_scale"]
+        ox, oy, _ = mapping["geo_lonlat_offset"]
+        lon, lat = (x - ox) / sx, (y - oy) / sy
+    else:
+        lon = np.degrees(np.arctan2(y, x))
+        lat = np.degrees(np.arctan2(z, np.hypot(x, y)))
+    for name, values in (("geo_lon", lon), ("geo_lat", lat)):
+        attr = data.attributes.get(name)
+        if attr is None or attr.data_type != "FLOAT" or attr.domain != "POINT":
+            if attr is not None:
+                data.attributes.remove(attr)
+            attr = data.attributes.new(name, "FLOAT", "POINT")
+        attr.data.foreach_set("value", values.astype(np.float32))
+
+
+def stamp_lonlat_mapping(obj, settings, bounds=None):
+    """Write lonlat_mapping_props onto *obj*. A flat object placed by its
+    location (point markers) has that location folded into the offset, so
+    its local coordinates still map back to the right lon/lat."""
+    props = lonlat_mapping_props(settings, bounds)
+    if "geo_lonlat_offset" in props:
+        ox, oy, oz = props["geo_lonlat_offset"]
+        loc = obj.location
+        props["geo_lonlat_offset"] = (ox - loc[0], oy - loc[1], oz)
+    else:
+        for key in ("geo_lonlat_scale", "geo_lonlat_offset"):
+            if key in obj:
+                del obj[key]
+    for key, value in props.items():
+        obj[key] = value
+
+
 # ---------------------------------------------------------------------------
 #  Blender PropertyGroup
 # ---------------------------------------------------------------------------

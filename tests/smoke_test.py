@@ -155,6 +155,40 @@ def globe_flat_node_groups():
     return f"{len(mesh.polygons)} faces, all on the globe"
 
 
+def geotiff_layer():
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    def tif(crs, bounds):
+        fd, path = tempfile.mkstemp(suffix=".tif")
+        os.close(fd)
+        with rasterio.open(path, "w", driver="GTiff", width=8, height=8, count=3, dtype="uint8",
+                           crs=crs, transform=from_bounds(*bounds, 8, 8)) as dst:
+            dst.write(np.full((3, 8, 8), 200, np.uint8))
+        return path
+
+    for obj in bpy.context.selected_objects:
+        obj.select_set(False)
+    path = tif("EPSG:4326", (-100, 30, -80, 50))
+    assert bpy.ops.object.add_geotiff_layer(filepath=path) == {"FINISHED"}
+    name = os.path.splitext(os.path.basename(path))[0]
+    image = bpy.data.images[name]
+    assert image.packed_file is not None, "image isn't packed"
+    assert tuple(image["geo_bounds"]) == (-100, 30, -80, 50), tuple(image["geo_bounds"])
+    globe = bpy.data.objects["GeoReferenceGlobe"]
+    layers = [n for m in globe.data.materials for n in m.node_tree.nodes
+              if n.bl_idname == "ShaderNodeGroup" and n.node_tree.name == "GeoTIFF: " + name]
+    assert layers, "layer not added to the reference globe"
+    # Projected rasters are refused rather than misplaced.
+    try:
+        bpy.ops.object.add_geotiff_layer(filepath=tif("EPSG:32616", (3e5, 4e6, 4e5, 4.1e6)))
+        raise AssertionError("projected raster was accepted")
+    except RuntimeError as exc:
+        assert "Reproject" in str(exc), exc
+    return f"{image.size[0]}x{image.size[1]} layer on the reference globe; projected raster refused"
+
+
 def natural_earth():
     assert bpy.ops.object.refresh_geo_country_list() == {"FINISHED"}
     return f"{len(bpy.context.scene.country_wireframe_settings.country_items)} countries"
@@ -167,6 +201,7 @@ check("GPX import", gpx_import)
 check("constant-mass emission generator", emission_generator)
 check("pair-names node group (nodebpy)", pair_names_node_group)
 check("globe/flat node groups", globe_flat_node_groups)
+check("GeoTIFF layer", geotiff_layer)
 if NETWORK:
     check("Natural Earth country list (network)", natural_earth)
 
