@@ -48,21 +48,31 @@ Rarely changed options are in collapsed sub-panels.
     one wireframe or curve object per feature, carrying its OSM tags. A
     raw Overpass query can be used instead under Advanced Query.
   - **Imagery**: Blue Marble or a raster file on the globe.
-    - **Add GeoTIFF Layer** drapes a GeoTIFF over the selected objects
-      (the reference globe if nothing is selected), on the globe or a flat
-      map, by longitude/latitude. No UVs are needed. The GeoTIFF must be
-      north-up and in longitude/latitude. Reproject other files first,
-      e.g. `gdalwarp -t_srs EPSG:4326 in.tif out.tif`, or turn on
-      **Reproject to Lon/Lat** in the file browser's options to warp them
-      to EPSG:4326 in memory (fine for typical projected rasters; do
-      datum shifts and antimeridian or polar data outside Blender). Each file becomes
-      a `GeoTIFF: <name>` layer in front of the material's Base Color, so
-      layers stack and show what's below outside the raster and at
-      nodata. Three-band files are used as color; single-band files keep
-      their raw values (the layer's Value output) and are colored with an
-      editable color ramp. Flat objects only line up if they came from
-      one of the importers here, which store each object's map mapping on
-      it.
+    - **GeoTIFF Layers**: **Add GeoTIFF Layer** drapes a GeoTIFF over
+      the selected objects (the reference globe if nothing is selected),
+      on the globe or a flat map, by longitude/latitude. No UVs are
+      needed. The GeoTIFF must be north-up and in longitude/latitude.
+      Reproject other files first, e.g. `gdalwarp -t_srs EPSG:4326 in.tif
+      out.tif`, or turn on **Reproject to Lon/Lat** in the file browser's
+      options to warp them to EPSG:4326 in memory (fine for typical
+      projected rasters; do datum shifts and antimeridian or polar data
+      outside Blender).
+      - Each file becomes a `GeoTIFF: <name>` layer in front of the
+        material's Base Color. Layers stack, and show what's below outside
+        the raster and at nodata. The panel lists the active object's
+        layers (or the globe's) with visibility, opacity, order, remove,
+        and the value range of single-band files.
+      - Three-band files are used as color; single-band files keep their
+        raw values (the layer's Value output) and are colored with an
+        editable color ramp.
+      - A layer only shows on faces. Imported wireframes and curves have
+        none until filled, e.g. with Geometry Nodes: Geo Globe To Flat →
+        Fill Curve → Set Material → Geo Flat To Globe (Fill Curve's output
+        has no material without Set Material). Concave shapes and holes
+        fill correctly. The operator warns about objects with no faces, or
+        faces with no material.
+      - Flat objects only line up if they came from one of the importers
+        here, which store each object's mapping on it.
   - **Longitude/latitude on imports**: meshes made by the importers here
     (GeoJSON/OSM wireframes, country boundaries, GPX, the Local Flat Map's
     source geometry and the reference globe) have per-point `geo_lon` and
@@ -70,8 +80,9 @@ Rarely changed options are in collapsed sub-panels.
     or an Attribute node in shaders. Point markers have them as object
     properties. Curve-mode imports can't hold attributes, but like every
     import they carry the per-object mapping Add GeoTIFF Layer uses.
-  - **Flat-space node groups**: creating the reference globe also adds
-    two geometry-node groups, **Geo Globe To Flat** and **Geo Flat To
+  - **Flat-space node groups**: creating the reference globe (or adding a
+    GeoTIFF layer to objects with no faces) also adds two geometry-node
+    groups, **Geo Globe To Flat** and **Geo Flat To
     Globe**. Use them as nodes or as modifiers around operations that need
     local Z = 0, such as Fill Curve on an imported polygon: Globe To Flat
     → Fill Curve → Flat To Globe. Flat space is an equirectangular map

@@ -24,6 +24,8 @@ import os
 import bpy
 from bpy_extras.io_utils import ImportHelper
 
+from .country_wireframes import _AVLGISPanel
+
 LONLAT_GROUP_NAME = "Geo LonLat"
 RASTER_UV_GROUP_NAME = "Geo Raster UV"
 LAYER_GROUP_PREFIX = "GeoTIFF: "
@@ -461,7 +463,7 @@ def build_layer_group(image):
     if image.get("geo_is_data"):
         lo, hi = image.get("geo_value_range", (0.0, 1.0))
         remap = nodes.new("ShaderNodeMapRange")
-        remap.label = "Value Range"
+        remap.name = remap.label = "Value Range"
         remap.location = (100, 300)
         remap.inputs["From Min"].default_value = lo
         remap.inputs["From Max"].default_value = hi if hi > lo else lo + 1.0
@@ -510,30 +512,92 @@ def _principled(material):
     return None
 
 
-def add_layer_to_material(material, layer_group):
-    """Put the layer in front of the material's Principled BSDF Base Color.
-    Returns False if the material has no Principled BSDF; a material that
-    already has the layer is left as is."""
+def is_layer_node(node):
+    return (
+        node.bl_idname == "ShaderNodeGroup"
+        and node.node_tree is not None
+        and node.node_tree.name.startswith(LAYER_GROUP_PREFIX)
+    )
+
+
+def layer_chain(material):
+    """The material's GeoTIFF layers feeding its Principled BSDF's Base
+    Color, top (nearest the BSDF) first, plus what's below the bottom one:
+    (layers, below_socket, below_color). below_socket is None when the
+    bottom layer's Color input is a plain color, below_color.
+    Returns None if the material has no Principled BSDF."""
     bsdf = _principled(material)
     if bsdf is None:
-        return False
-    nodes, links = material.node_tree.nodes, material.node_tree.links
-    layers = [n for n in nodes if n.bl_idname == "ShaderNodeGroup"
-              and n.node_tree is not None and n.node_tree.name.startswith(LAYER_GROUP_PREFIX)]
-    if any(n.node_tree is layer_group for n in layers):
-        return True
-
+        return None
     base = bsdf.inputs["Base Color"]
-    node = nodes.new("ShaderNodeGroup")
+    layers = []
+    socket = base.links[0].from_socket if base.is_linked else None
+    below_color = tuple(base.default_value)
+    while socket is not None and is_layer_node(socket.node) and socket.identifier == socket.node.outputs["Color"].identifier:
+        node = socket.node
+        layers.append(node)
+        color_in = node.inputs["Color"]
+        below_color = tuple(color_in.default_value)
+        socket = color_in.links[0].from_socket if color_in.is_linked else None
+    return layers, socket, below_color
+
+
+def _relink(material, layers, below_socket, below_color):
+    """Chain *layers* (top first) between below_socket/below_color and the
+    Principled BSDF's Base Color, and lay them out in a column."""
+    bsdf = _principled(material)
+    base = bsdf.inputs["Base Color"]
+    links = material.node_tree.links
+    for socket in [base] + [n.inputs["Color"] for n in layers]:
+        for link in list(socket.links):
+            links.remove(link)
+    previous = below_socket
+    for index, node in enumerate(reversed(layers)):
+        if previous is None:
+            node.inputs["Color"].default_value = below_color
+        else:
+            links.new(previous, node.inputs["Color"])
+        previous = node.outputs["Color"]
+        node.location = (bsdf.location.x - 300, bsdf.location.y + 220 * index)
+    if previous is None:
+        base.default_value = below_color
+    else:
+        links.new(previous, base)
+
+
+def add_layer_to_material(material, layer_group):
+    """Put the layer on top of the material's GeoTIFF layers, in front of
+    its Principled BSDF Base Color. Returns False if the material has no
+    Principled BSDF; a material that already has the layer is left as is."""
+    chain = layer_chain(material)
+    if chain is None:
+        return False
+    layers, below_socket, below_color = chain
+    if any(n.node_tree is layer_group for n in material.node_tree.nodes if is_layer_node(n)):
+        return True
+    node = material.node_tree.nodes.new("ShaderNodeGroup")
     node.node_tree = layer_group
     node.label = layer_group.name
-    node.location = (bsdf.location.x - 300, bsdf.location.y + 200 * len(layers))
-    if base.is_linked:
-        links.new(base.links[0].from_socket, node.inputs["Color"])
-    else:
-        node.inputs["Color"].default_value = base.default_value
-    links.new(node.outputs["Color"], base)
+    _relink(material, [node] + layers, below_socket, below_color)
     return True
+
+
+def move_layer(material, node, direction):
+    """Move a layer one step "UP" (toward the BSDF, drawn over more layers)
+    or "DOWN" in its material's stack."""
+    layers, below_socket, below_color = layer_chain(material)
+    index = layers.index(node)
+    other = index - 1 if direction == "UP" else index + 1
+    if 0 <= other < len(layers):
+        layers[index], layers[other] = layers[other], layers[index]
+        _relink(material, layers, below_socket, below_color)
+
+
+def remove_layer(material, node):
+    layers, below_socket, below_color = layer_chain(material)
+    layers.remove(node)
+    material.node_tree.nodes.remove(node)
+    _relink(material, layers, below_socket, below_color)
 
 
 def apply_layer(objects, layer_group):
@@ -565,6 +629,29 @@ def apply_layer(objects, layer_group):
 # ---------------------------------------------------------------------------
 #  Operator
 # ---------------------------------------------------------------------------
+
+def _faces_problems(context, objects):
+    """Objects a layer won't show on: (no faces, faces without a material).
+    Checks the evaluated geometry, so faces made by modifiers count."""
+    depsgraph = context.evaluated_depsgraph_get()
+    no_faces, no_material = [], []
+    for obj in objects:
+        evaluated = obj.evaluated_get(depsgraph)
+        try:
+            mesh = evaluated.to_mesh()
+        except RuntimeError:
+            mesh = None
+        try:
+            if mesh is None or len(mesh.polygons) == 0:
+                no_faces.append(obj)
+            elif not any(mesh.materials):
+                # e.g. Fill Curve output from a curve object, which doesn't
+                # pick up the object's material without a Set Material node.
+                no_material.append(obj)
+        finally:
+            evaluated.to_mesh_clear()
+    return no_faces, no_material
+
 
 class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
     bl_idname = "object.add_geotiff_layer"
@@ -616,6 +703,7 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
         layer = build_layer_group(image)
         done, skipped = apply_layer(targets, layer)
 
+        no_faces, no_material = _faces_problems(context, targets)
         unmapped = sum(1 for o in targets if "geo_lonlat_flat" not in o)
         w, h = raster["size"]
         kind = "data" if raster["is_data"] else "color"
@@ -629,11 +717,136 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
                 f"; {unmapped} object(s) weren't made by a GeoViz importer and are "
                 "placed as if on the globe"
             )
-        self.report({"WARNING"} if skipped or unmapped else {"INFO"}, message)
+        if no_faces:
+            # Make sure the groups the message points at exist; they're
+            # otherwise only made with the reference globe.
+            from .globe_flat_nodes import ensure_globe_flat_node_groups
+
+            ensure_globe_flat_node_groups(context.scene.geo_coord_settings.globe_radius)
+            message += (
+                f"; {len(no_faces)} object(s) have no faces, so it won't show on them "
+                "until they're filled (e.g. Geometry Nodes: Geo Globe To Flat -> "
+                "Fill Curve -> Set Material -> Geo Flat To Globe)"
+            )
+        if no_material:
+            message += (
+                f"; {len(no_material)} object(s) have faces with no material, e.g. "
+                "made by Fill Curve; add a Set Material node"
+            )
+        problems = skipped or unmapped or no_faces or no_material
+        self.report({"WARNING"} if problems else {"INFO"}, message)
         return {"FINISHED"}
 
 
-CLASSES = (OBJECT_OT_add_geotiff_layer,)
+def _find_layer(material_name, node_name):
+    material = bpy.data.materials.get(material_name)
+    node = material.node_tree.nodes.get(node_name) if material and material.node_tree else None
+    if node is None or not is_layer_node(node):
+        return None, None
+    return material, node
+
+
+class _LayerOperator:
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+    material: bpy.props.StringProperty()
+    node: bpy.props.StringProperty()
+
+
+class OBJECT_OT_geotiff_layer_move(_LayerOperator, bpy.types.Operator):
+    bl_idname = "object.geotiff_layer_move"
+    bl_label = "Move GeoTIFF Layer"
+    bl_description = "Move the layer up (drawn over the layers below it) or down"
+    direction: bpy.props.EnumProperty(items=[("UP", "Up", ""), ("DOWN", "Down", "")])
+
+    def execute(self, context):
+        material, node = _find_layer(self.material, self.node)
+        if node is None:
+            return {"CANCELLED"}
+        move_layer(material, node, self.direction)
+        return {"FINISHED"}
+
+
+class OBJECT_OT_geotiff_layer_remove(_LayerOperator, bpy.types.Operator):
+    bl_idname = "object.geotiff_layer_remove"
+    bl_label = "Remove GeoTIFF Layer"
+    bl_description = "Remove the layer from this material (the image stays in the file)"
+
+    def execute(self, context):
+        material, node = _find_layer(self.material, self.node)
+        if node is None:
+            return {"CANCELLED"}
+        remove_layer(material, node)
+        return {"FINISHED"}
+
+
+def _layer_object(context):
+    """The object whose layers the panel shows: the active object if it has
+    any, otherwise the reference globe."""
+    def has_layers(obj):
+        data = getattr(obj, "data", None)
+        materials = getattr(data, "materials", None) or []
+        return any(m and m.node_tree and any(is_layer_node(n) for n in m.node_tree.nodes)
+                   for m in materials)
+
+    obj = context.active_object
+    if obj is not None and has_layers(obj):
+        return obj
+    globe = bpy.data.objects.get("GeoReferenceGlobe")
+    if globe is not None and has_layers(globe):
+        return globe
+    return obj
+
+
+class VIEW3D_PT_geotiff_layers(_AVLGISPanel, bpy.types.Panel):
+    bl_label = "GeoTIFF Layers"
+    bl_idname = "VIEW3D_PT_geotiff_layers"
+    bl_parent_id = "VIEW3D_PT_country_wireframes_imagery"
+    bl_order = -1
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator("object.add_geotiff_layer", icon="IMAGE_RGB_ALPHA")
+        obj = _layer_object(context)
+        materials = [m for m in getattr(getattr(obj, "data", None), "materials", None) or [] if m]
+        chains = [(m, layer_chain(m)) for m in materials]
+        chains = [(m, c[0]) for m, c in chains if c and c[0]]
+        if not chains:
+            layout.label(text="No layers on the active object or the globe")
+            return
+        layout.label(text=f"On {obj.name}, top first:", icon="OBJECT_DATA")
+        for material, layers in chains:
+            box = layout.box()
+            if len(chains) > 1:
+                box.label(text=material.name, icon="MATERIAL")
+            for index, node in enumerate(layers):
+                col = box.column(align=True)
+                row = col.row(align=True)
+                row.prop(node, "mute", text="", icon="HIDE_ON" if node.mute else "HIDE_OFF", emboss=False)
+                row.label(text=node.node_tree.name[len(LAYER_GROUP_PREFIX):])
+                for direction, icon, enabled in (
+                    ("UP", "TRIA_UP", index > 0),
+                    ("DOWN", "TRIA_DOWN", index < len(layers) - 1),
+                ):
+                    sub = row.row(align=True)
+                    sub.enabled = enabled
+                    op = sub.operator("object.geotiff_layer_move", text="", icon=icon)
+                    op.material, op.node, op.direction = material.name, node.name, direction
+                op = row.operator("object.geotiff_layer_remove", text="", icon="X")
+                op.material, op.node = material.name, node.name
+                col.prop(node.inputs["Opacity"], "default_value", text="Opacity", slider=True)
+                remap = node.node_tree.nodes.get("Value Range")
+                if remap is not None:
+                    row = col.row(align=True)
+                    row.prop(remap.inputs["From Min"], "default_value", text="Min")
+                    row.prop(remap.inputs["From Max"], "default_value", text="Max")
+
+
+CLASSES = (
+    OBJECT_OT_add_geotiff_layer,
+    OBJECT_OT_geotiff_layer_move,
+    OBJECT_OT_geotiff_layer_remove,
+    VIEW3D_PT_geotiff_layers,
+)
 
 
 def register():

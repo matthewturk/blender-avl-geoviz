@@ -3934,10 +3934,6 @@ class VIEW3D_PT_country_wireframes_imagery(_AVLGISPanel, bpy.types.Panel):
             "object.apply_texture_from_raster",
             icon="FILE_IMAGE",
         )
-        layout.operator(
-            "object.add_geotiff_layer",
-            icon="IMAGE_RGB_ALPHA",
-        )
 
 
 class VIEW3D_PT_country_wireframes_imagery_clouds(_AVLGISPanel, bpy.types.Panel):
