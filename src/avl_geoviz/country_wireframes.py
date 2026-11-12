@@ -11,6 +11,7 @@ import bpy
 from bpy_extras.io_utils import ImportHelper
 
 from . import geo_coord
+from .globe_flat_nodes import ensure_globe_flat_node_groups
 from . import osm_area
 from .geo_coord import (
     flat_project,
@@ -1950,6 +1951,9 @@ def _create_reference_globe(collection, radius, resolution, globe_root=None):
         poly.use_smooth = True
     collection.objects.link(obj)
     _parent_to_globe_root(obj, globe_root)
+    # Node groups for running flat-space operations (Fill Curve, ...) on
+    # globe imports: Geo Globe To Flat -> operation -> Geo Flat To Globe.
+    ensure_globe_flat_node_groups(radius)
     return obj
 
 
