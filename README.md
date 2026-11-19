@@ -25,7 +25,16 @@ Rarely changed options are in collapsed sub-panels.
 - **Area & Features**: the area and the OpenStreetMap features that both
   importers below fetch.
   - **Area**: a south,west,north,east box (paste it with any separators),
-    or **From Center**, which takes a point and a size in km. The panel
+    or **From Center**, which takes a point and a size in km. Or set it
+    without coordinates:
+    - **From View** / **From Camera**: the part of the globe the 3D
+      Viewport or the scene camera shows (globe only).
+    - **Find a place**: type a name (a city, park, county, neighbourhood)
+      and pick a result. Uses OpenStreetMap's Nominatim when online access
+      is on, otherwise the bundled list of cities (population 15,000+),
+      with a box sized roughly by population.
+    - The box is drawn on the globe as an orange outline (toggle next to
+      From Camera), solid where it faces you and faint behind the globe. The panel
     shows the box's size as you edit it. It catches swapped lat/lon
     order, reversed or antimeridian-crossing boxes and typos before
     anything is fetched.
@@ -50,6 +59,26 @@ Rarely changed options are in collapsed sub-panels.
   - **Imagery**: Blue Marble or a raster file on the globe. **Globe
     Segments** (256 by default) sets how finely the reference globe is
     built; changing it rebuilds an existing globe in place.
+    - **Area Imagery**: fetches imagery for the Area & Features box from
+      public-domain or NASA sources and places it as a new object covering
+      the box or as a layer on the selected objects (the globe if none).
+      Pick a source and a resolution in metres per pixel; the panel shows
+      the level it will use, the tile count and the image size before
+      anything downloads. Requests larger than **Patch Size** (4096 px a
+      side by default) are split into a grid of patches, each its own
+      object (kept together in one collection) or layer; patches overlap
+      slightly so no seams show. Limits: 1000 tiles, 256 megapixels and 64
+      patches per request; above 200 tiles it asks first. Fetches run in
+      the background with progress in the status bar: press Esc or
+      **Cancel Imagery Fetch** in the panel to stop, keeping the patches
+      already made. Sources:
+      USGS aerial imagery (US only, about 1-2 m), NASA's cloud-free Landsat
+      2000 composite (global, 30 m), daily HLS Sentinel-2 and Landsat
+      (global, 30 m; pick a date with a clear pass), daily VIIRS and MODIS
+      (250 m) and Blue Marble Next Generation (500 m). The source's credit
+      is stored on the image and shown in the GeoTIFF Layers list. Tiles are
+      cached in the extension's user folder; fetching the same request again
+      updates what it made. Needs Allow Online Access.
     - **GeoTIFF Layers**: **Add GeoTIFF Layer** drapes a GeoTIFF over
       the selected objects (the reference globe if nothing is selected),
       on the globe or a flat map, by longitude/latitude. No UVs are
@@ -70,7 +99,10 @@ Rarely changed options are in collapsed sub-panels.
       - **Import GeoTIFF as Object** makes a new object covering the
         file's extent (a patch of the globe, or a rectangle on a flat map)
         with the GeoTIFF as its layer. Re-importing the same file updates
-        that object.
+        that object. On the globe it sits tens of metres above the
+        sphere, just enough to clear the globe's faces, rather than at the
+        Overlay Offset other overlays use (6 km at the default), so imagery
+        doesn't float in close-ups.
       - A layer only shows on faces. Imported wireframes and curves have
         none until filled: select them and use **Fill Polygons** (also in
         GeoJSON Import). It adds a Geo Fill Polygons modifier, centered on
@@ -102,8 +134,9 @@ Rarely changed options are in collapsed sub-panels.
   extruded buildings, roads with widths and point markers from the
   selected features (other kinds of features in the preset are skipped),
   plus terrain, elevation and satellite imagery. Satellite imagery is
-  saved next to the .blend (or in the extension's user folder for an
-  unsaved file).
+  USGS aerial imagery in the US (zoom up to 16, about 1-2 m) and NASA's
+  30 m Landsat 2000 composite elsewhere, and is saved next to the .blend
+  (or in the extension's user folder for an unsaved file).
 
 The default area is about 1 km² around the UIUC Main Quad.
 

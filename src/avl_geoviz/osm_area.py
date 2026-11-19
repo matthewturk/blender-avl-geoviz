@@ -567,7 +567,7 @@ def draw_area_status(layout, settings, recommended_km2=None):
     elif area > recommended_km2:
         icon = "ERROR"
     col.label(text=_osm_safety_shared.format_dims(*bbox), icon=icon)
-    col.label(text=f"Recommended ≤ {recommended_km2:g} km², limit {limit:g} km²")
+    col.label(text=f"OSM features: ≤ {recommended_km2:g} km² recommended, limit {limit:g} km²")
     for hint in _osm_safety_shared.bbox_hints(*bbox):
         draw_wrapped(col, hint, icon="INFO")
 
@@ -593,6 +593,9 @@ class VIEW3D_PT_avl_gis_area(_AreaPanel, bpy.types.Panel):
         row.operator("object.osm_bbox_from_center", text="From Center", icon="PIVOT_CURSOR")
         box.prop(settings, "bbox", text="")
         box.label(text="south, west, north, east", icon="BLANK1")
+        from .area_tools import draw_area_tools
+
+        draw_area_tools(box, context)
         draw_area_status(box, settings)
 
         box = layout.box()

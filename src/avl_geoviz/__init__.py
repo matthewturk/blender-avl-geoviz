@@ -6,9 +6,11 @@ import bpy
 from . import (
     geo_coord,
     osm_area,
+    area_tools,
     country_wireframes,
     globe_flat_nodes,
     geo_raster,
+    area_imagery,
     flat_gis_importer,
     gpx_import,
     data_visualization_menu,
@@ -23,9 +25,11 @@ from . import (
 _MODULES = (
     geo_coord,
     osm_area,
+    area_tools,
     country_wireframes,
     globe_flat_nodes,
     geo_raster,
+    area_imagery,
     flat_gis_importer,
     gpx_import,
     data_visualization_menu,
