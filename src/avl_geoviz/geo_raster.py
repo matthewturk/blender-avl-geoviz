@@ -31,6 +31,10 @@ RASTER_UV_GROUP_NAME = "Geo Raster UV"
 LAYER_GROUP_PREFIX = "GeoTIFF: "
 SHARED_MATERIAL_NAME = "GeoTIFF Layers"
 
+# Extra height of globe extent objects above the sphere, as a fraction of
+# the radius: about 13 m on Earth, enough for depth precision.
+_GLOBE_LIFT = 2e-6
+
 # Bump when a shared group's layout or interface changes so existing files
 # get it rebuilt.
 _GROUP_VERSION = 1
@@ -689,12 +693,7 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
     )
 
     def execute(self, context):
-        targets = [o for o in context.selected_objects if o.type in {"MESH", "CURVE"}]
-        if not targets:
-            from .country_wireframes import _ensure_reference_globe
-
-            targets = [_ensure_reference_globe(context, context.scene.country_wireframe_settings)]
-
+        targets = default_targets(context)
         try:
             raster = read_geotiff(self.filepath, self.max_size, self.reproject)
         except GeoTiffError as exc:
@@ -705,54 +704,78 @@ class OBJECT_OT_add_geotiff_layer(bpy.types.Operator, ImportHelper):
             return {"CANCELLED"}
 
         name = os.path.splitext(os.path.basename(self.filepath))[0]
-        image = _image_from_raster(name, self.filepath, raster)
-        layer = build_layer_group(image)
-        done, skipped = apply_layer(targets, layer)
-
-        from .globe_flat_nodes import sync_fill_material
-
-        for obj in targets:
-            sync_fill_material(obj)
-        no_faces, no_material = _faces_problems(context, targets)
-        unmapped = sum(1 for o in targets if "geo_lonlat_flat" not in o)
-        w, h = raster["size"]
-        kind = "data" if raster["is_data"] else "color"
-        message = f"Added {image.name} ({w}x{h} {kind}) to {done} object(s)"
-        if raster["reprojected_from"]:
-            message += f", reprojected from {raster['reprojected_from']}"
-        if skipped:
-            message += f"; skipped {skipped} whose materials have no Principled BSDF"
-        if unmapped and context.scene.geo_coord_settings.coordinate_space == "FLAT":
-            message += (
-                f"; {unmapped} object(s) weren't made by a GeoViz importer and are "
-                "placed as if on the globe"
-            )
-        if no_faces:
-            message += (
-                f"; {len(no_faces)} object(s) have no faces, so it won't show on them "
-                "until they're filled: use Fill Polygons"
-            )
-        if no_material:
-            message += (
-                f"; {len(no_material)} object(s) have faces with no material, e.g. "
-                "made by Fill Curve; use Fill Polygons or add a Set Material node"
-            )
-        problems = skipped or unmapped or no_faces or no_material
+        _image, message, problems = drape_raster(context, name, self.filepath, raster, targets)
         self.report({"WARNING"} if problems else {"INFO"}, message)
         return {"FINISHED"}
 
 
-def build_extent_object(context, name, path, bounds):
-    """A mesh covering the raster's bounds in the scene's space: a lat/lon
-    grid on the globe (as fine as the reference globe's Globe Segments) or a
-    single quad on a flat map (every flat projection is affine). Re-importing
-    the same file replaces the mesh of the object it made before."""
+def drape_raster(context, name, path, raster, targets):
+    """Add *raster* (from read_geotiff) as a layer on *targets*. Returns the
+    image, a report message and whether it names problems."""
+    image = _image_from_raster(name, path, raster)
+    layer = build_layer_group(image)
+    done, skipped = apply_layer(targets, layer)
+
+    from .globe_flat_nodes import sync_fill_material
+
+    for obj in targets:
+        sync_fill_material(obj)
+    no_faces, no_material = _faces_problems(context, targets)
+    unmapped = sum(1 for o in targets if "geo_lonlat_flat" not in o)
+    w, h = raster["size"]
+    kind = "data" if raster["is_data"] else "color"
+    message = f"Added {image.name} ({w}x{h} {kind}) to {done} object(s)"
+    if raster["reprojected_from"]:
+        message += f", reprojected from {raster['reprojected_from']}"
+    if skipped:
+        message += f"; skipped {skipped} whose materials have no Principled BSDF"
+    if unmapped and context.scene.geo_coord_settings.coordinate_space == "FLAT":
+        message += (
+            f"; {unmapped} object(s) weren't made by a GeoViz importer and are "
+            "placed as if on the globe"
+        )
+    if no_faces:
+        message += (
+            f"; {len(no_faces)} object(s) have no faces, so it won't show on them "
+            "until they're filled: use Fill Polygons"
+        )
+    if no_material:
+        message += (
+            f"; {len(no_material)} object(s) have faces with no material, e.g. "
+            "made by Fill Curve; use Fill Polygons or add a Set Material node"
+        )
+    return image, message, bool(skipped or unmapped or no_faces or no_material)
+
+
+def default_targets(context):
+    """Selected meshes and curves, or the reference globe if there are none."""
+    targets = [o for o in context.selected_objects if o.type in {"MESH", "CURVE"}]
+    if not targets:
+        from .country_wireframes import _ensure_reference_globe
+
+        targets = [_ensure_reference_globe(context, context.scene.country_wireframe_settings)]
+    return targets
+
+
+def build_extent_object(context, name, path, bounds, projection_bounds=None):
+    """A mesh covering *bounds* in the scene's space: a lat/lon grid on the
+    globe or a single quad on a flat map (every flat projection is affine).
+    Flat maps are projected with *projection_bounds* (default *bounds*), so
+    pieces of one area line up. Re-importing the same file replaces the mesh
+    of the object it made before.
+
+    On the globe the grid is at least as fine as the reference globe's
+    Globe Segments and 0.25 degrees, and sits just far enough above the
+    globe that its flat faces clear the sphere (and so the globe's own
+    faces, which are inside it): metres, not GeoOverlayRoot's Overlay Offset
+    (6 km at the default), which would make imagery float in close-ups."""
     import math
 
     import numpy as np
 
     from .country_wireframes import (
         _ensure_globe_overlay_root_empty,
+        _ensure_globe_root_empty,
         _get_or_create_collection,
         _parent_to_globe_root,
     )
@@ -765,17 +788,24 @@ def build_extent_object(context, name, path, bounds):
 
     cs = context.scene.geo_coord_settings
     west, south, east, north = bounds
+    projection_bounds = projection_bounds or bounds
     is_globe = cs.coordinate_space == "GLOBE"
+    radius = cs.globe_radius
     if is_globe:
-        step = 360.0 / max(8, context.scene.country_wireframe_settings.globe_segments)
-        nx = max(1, min(2048, math.ceil((east - west) / step)))
-        ny = max(1, min(1024, math.ceil((north - south) / step)))
+        step = min(0.25, 360.0 / max(8, context.scene.country_wireframe_settings.globe_segments))
+        nx = max(1, min(512, math.ceil((east - west) / step)))
+        ny = max(1, min(512, math.ceil((north - south) / step)))
+        # A face's center sags below its corners by about r * d^2 / 8 (d
+        # its diagonal in radians); lift the corners that much, plus a
+        # little for depth precision.
+        d = math.radians(math.hypot((east - west) / nx, (north - south) / ny))
+        radius *= 1.0 + d * d / 8.0 + _GLOBE_LIFT
     else:
         nx = ny = 1
     lons = np.linspace(west, east, nx + 1)
     lats = np.linspace(south, north, ny + 1)
     verts = [
-        project_point(lat, lon, 0.0, cs, bounds=bounds, radius=cs.globe_radius)
+        project_point(lat, lon, 0.0, cs, bounds=projection_bounds, radius=radius)
         for lat in lats for lon in lons
     ]
     row = nx + 1
@@ -790,7 +820,7 @@ def build_extent_object(context, name, path, bounds):
     mesh.update()
     if is_globe:
         mesh.polygons.foreach_set("use_smooth", [True] * len(mesh.polygons))
-    store_lonlat_attributes(mesh, lonlat_mapping_props(cs, bounds))
+    store_lonlat_attributes(mesh, lonlat_mapping_props(cs, projection_bounds))
 
     obj = next((o for o in bpy.data.objects
                 if o.get("geo_kind") == "geotiff_extent" and o.get("geo_source_file") == path), None)
@@ -808,8 +838,12 @@ def build_extent_object(context, name, path, bounds):
     obj["geo_kind"] = "geotiff_extent"
     obj["geo_name"] = name
     obj["geo_source_file"] = path
-    stamp_lonlat_mapping(obj, cs, bounds)
-    _parent_to_globe_root(obj, _ensure_globe_overlay_root_empty(context))
+    stamp_lonlat_mapping(obj, cs, projection_bounds)
+    obj["geo_lift"] = radius / cs.globe_radius - 1.0
+    # On the globe, under the globe root rather than GeoOverlayRoot, whose
+    # scale is the Overlay Offset; flat maps keep it, like other flat imports.
+    _parent_to_globe_root(
+        obj, _ensure_globe_root_empty(context) if is_globe else _ensure_globe_overlay_root_empty(context))
     return obj
 
 
@@ -838,30 +872,41 @@ class OBJECT_OT_import_geotiff_extent(bpy.types.Operator, ImportHelper):
             return {"CANCELLED"}
 
         name = os.path.splitext(os.path.basename(self.filepath))[0]
-        image = _image_from_raster(name, self.filepath, raster)
-        layer = build_layer_group(image)
-        obj = build_extent_object(context, name, self.filepath, raster["bounds"])
-        if not any(obj.data.materials):
-            material = bpy.data.materials.get(f"GeoTIFF {name}") or bpy.data.materials.new(f"GeoTIFF {name}")
-            if material.node_tree is None:
-                material.use_nodes = True
-            obj.data.materials.clear()
-            obj.data.materials.append(material)
-        for material in obj.data.materials:
-            add_layer_to_material(material, layer)
-
-        for other in context.selected_objects:
-            other.select_set(False)
-        obj.select_set(True)
-        context.view_layer.objects.active = obj
-        west, south, east, north = raster["bounds"]
-        message = (
-            f"Made {obj.name} covering {west:.4f}..{east:.4f} E, {south:.4f}..{north:.4f} N"
-        )
-        if raster["reprojected_from"]:
-            message += f" (reprojected from {raster['reprojected_from']})"
+        _image, _obj, message = raster_object(context, name, self.filepath, raster)
         self.report({"INFO"}, message)
         return {"FINISHED"}
+
+
+def raster_object(context, name, path, raster, extent=None, projection_bounds=None):
+    """Make (or update) an object covering *extent* (default *raster*'s
+    bounds; west, south, east, north) with the raster as its layer, and make
+    it the only selected object. See build_extent_object for
+    *projection_bounds*. Returns the image, the object and a report
+    message."""
+    image = _image_from_raster(name, path, raster)
+    layer = build_layer_group(image)
+    extent = extent or raster["bounds"]
+    obj = build_extent_object(context, name, path, extent, projection_bounds)
+    if not any(obj.data.materials):
+        material = bpy.data.materials.get(f"GeoTIFF {name}") or bpy.data.materials.new(f"GeoTIFF {name}")
+        if material.node_tree is None:
+            material.use_nodes = True
+        obj.data.materials.clear()
+        obj.data.materials.append(material)
+    for material in obj.data.materials:
+        add_layer_to_material(material, layer)
+
+    for other in context.selected_objects:
+        other.select_set(False)
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+    west, south, east, north = extent
+    message = (
+        f"Made {obj.name} covering {west:.4f}..{east:.4f} E, {south:.4f}..{north:.4f} N"
+    )
+    if raster["reprojected_from"]:
+        message += f" (reprojected from {raster['reprojected_from']})"
+    return image, obj, message
 
 
 def _find_layer(material_name, node_name):
@@ -963,6 +1008,9 @@ class VIEW3D_PT_geotiff_layers(_AVLGISPanel, bpy.types.Panel):
                 op = row.operator("object.geotiff_layer_remove", text="", icon="X")
                 op.material, op.node = material.name, node.name
                 col.prop(node.inputs["Opacity"], "default_value", text="Opacity", slider=True)
+                image = bpy.data.images.get(node.node_tree.name[len(LAYER_GROUP_PREFIX):])
+                if image is not None and image.get("geo_attribution"):
+                    col.label(text=image["geo_attribution"], icon="COPY_ID")
                 remap = node.node_tree.nodes.get("Value Range")
                 if remap is not None:
                     row = col.row(align=True)

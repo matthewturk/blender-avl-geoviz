@@ -3,13 +3,11 @@ import math
 import json
 import re
 import urllib.request
-import urllib.parse
-from io import BytesIO
 
 import bpy
 
 from .geo_coord import store_lonlat_attributes
-from . import _osm_safety_shared, osm_area
+from . import _osm_safety_shared, geo_tiles, osm_area
 
 # --- Library Check Helpers ---
 
@@ -56,78 +54,49 @@ def get_projection_factors(ref_lat):
 
 # --- Satellite Imagery Utilities ---
 
-def latlon_to_tile(lat, lon, zoom):
-    lat_rad = math.radians(lat)
-    n = 2.0 ** zoom
-    x = int((lon + 180.0) / 360.0 * n)
-    y = int((1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
-    return x, y
-
-def tile_to_latlon(x, y, zoom):
-    n = 2.0 ** zoom
-    lon = x / n * 360.0 - 180.0
-    lat_rad = math.atan(math.sinh(math.pi * (1.0 - 2.0 * y / n)))
-    lat = math.degrees(lat_rad)
-    return lat, lon
-
+# USGS imagery (US only) at the chosen zoom; elsewhere NASA's 30 m Landsat
+# 2000 composite. Both are public domain (geo_tiles).
+_SATELLITE_SOURCE = "USGS_IMAGERY"
+_SATELLITE_FALLBACK = "LANDSAT_2000"
 _MAX_SATELLITE_TILES = 100
 
 
-def download_and_stitch_satellite(min_lat, min_lon, max_lat, max_lon, zoom, output_path):
-    try:
-        from PIL import Image
-    except ImportError:
-        raise RuntimeError("Pillow library (PIL) is not available to stitch satellite imagery.")
+def _satellite_plan(settings, bbox):
+    source = geo_tiles.SOURCES_BY_KEY[_SATELLITE_SOURCE]
+    return geo_tiles.plan(source, bbox, min(settings.satellite_zoom, source.max_level))
 
-    x1, y1 = latlon_to_tile(max_lat, min_lon, zoom)
-    x2, y2 = latlon_to_tile(min_lat, max_lon, zoom)
-    
-    x_min, x_max = min(x1, x2), max(x1, x2)
-    y_min, y_max = min(y1, y2), max(y1, y2)
-    
-    num_x = x_max - x_min + 1
-    num_y = y_max - y_min + 1
-    
-    if num_x * num_y > _MAX_SATELLITE_TILES:
-        raise RuntimeError(
-            f"Requested area requires {num_x}x{num_y}={num_x*num_y} satellite tiles, which exceeds the safety limit of {_MAX_SATELLITE_TILES}. "
-            "Please decrease Zoom Level or decrease Bounding Box size."
-        )
 
-    tile_w = 256
-    tile_h = 256
-    stitched = Image.new('RGB', (num_x * tile_w, num_y * tile_h))
+def download_satellite(bbox, zoom, output_path):
+    """Fetch imagery for *bbox* (south, west, north, east), north-up in
+    longitude/latitude and cropped to it, and save it as a PNG. Returns
+    (min_lat, min_lon, max_lat, max_lon, source, warning or None)."""
+    from PIL import Image
 
-    total_tiles = num_x * num_y
-    print(f"[FlatGIS] Downloading {total_tiles} satellite tile(s) (zoom {zoom})...")
-    tiles_done = 0
-
-    for ty_idx, y in enumerate(range(y_min, y_max + 1)):
-        for tx_idx, x in enumerate(range(x_min, x_max + 1)):
-            url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{y}/{x}"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            try:
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    img_data = response.read()
-                    tile_img = Image.open(BytesIO(img_data))
-                    stitched.paste(tile_img, (tx_idx * tile_w, ty_idx * tile_h))
-            except Exception as e:
-                print(f"[FlatGIS] Failed tile {zoom}/{x}/{y}: {e}")
-                placeholder = Image.new('RGB', (tile_w, tile_h), color=(120, 130, 120))
-                stitched.paste(placeholder, (tx_idx * tile_w, ty_idx * tile_h))
-
-            tiles_done += 1
-            if tiles_done % 10 == 0 or tiles_done == total_tiles:
-                print(f"[FlatGIS] Satellite tiles: {tiles_done}/{total_tiles} done.")
-
+    if not geo_tiles.online_access():
+        raise RuntimeError("Online access is off: turn on Allow Online Access in Preferences > System")
+    south, west, north, east = bbox
+    source = geo_tiles.SOURCES_BY_KEY[_SATELLITE_SOURCE]
+    level = min(zoom, source.max_level)
+    cache = geo_tiles.cache_dir()
+    warning = None
+    if not geo_tiles.has_tile_at(source, (south + north) / 2, (west + east) / 2, level, cache_root=cache):
+        source = geo_tiles.SOURCES_BY_KEY[_SATELLITE_FALLBACK]
+        level = source.max_level
+        warning = (f"No USGS imagery here (it covers the US only); used {source.label}, "
+                   "which is much coarser")
+    plan = geo_tiles.plan(source, bbox, level)
+    if plan.tiles > _MAX_SATELLITE_TILES:
+        raise RuntimeError(f"Satellite imagery needs {plan.tiles} tiles (limit {_MAX_SATELLITE_TILES}). "
+                           "Lower Zoom Level or shrink the area.")
+    print(f"[FlatGIS] Downloading {plan.tiles} {source.short} tile(s) at level {level}...")
+    mosaic = geo_tiles.fetch(source, bbox, level, cache_root=cache)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    stitched.save(output_path)
-    print(f"[FlatGIS] Satellite imagery stitched and saved to {output_path}")
-
-    img_max_lat, img_min_lon = tile_to_latlon(x_min, y_min, zoom)
-    img_min_lat, img_max_lon = tile_to_latlon(x_max + 1, y_max + 1, zoom)
-
-    return img_min_lat, img_min_lon, img_max_lat, img_max_lon
+    Image.fromarray(mosaic.rgba[..., :3]).save(output_path)
+    print(f"[FlatGIS] Satellite imagery ({source.attribution}) saved to {output_path}")
+    if mosaic.missing and warning is None:
+        warning = f"{mosaic.missing} of {plan.tiles} satellite tiles had no imagery ({source.coverage})"
+    west, south, east, north = mosaic.bounds
+    return south, west, north, east, source, warning
 
 
 # --- Elevation API Utilities ---
@@ -893,21 +862,29 @@ def import_flat_gis_geojson_data(context, geojson_data, settings, bbox_bounds=No
         
         try:
             print("[FlatGIS] Fetching satellite imagery...")
-            img_min_lat, img_min_lon, img_max_lat, img_max_lon = download_and_stitch_satellite(
-                min_lat, min_lon, max_lat, max_lon, settings.satellite_zoom, satellite_img_path
+            img_min_lat, img_min_lon, img_max_lat, img_max_lon, source, sat_warning = download_satellite(
+                (min_lat, min_lon, max_lat, max_lon), settings.satellite_zoom, satellite_img_path
             )
-            
-            # Recalculate terrain dimensions to match stitched image bounds
+            if sat_warning and warnings is not None:
+                warnings.append(sat_warning)
+
+            # Recalculate terrain dimensions to match the image bounds
             terrain_x_min = (img_min_lon - ref_lon) * lon_to_meters
             terrain_y_min = (img_min_lat - ref_lat) * lat_to_meters
             terrain_x_max = (img_max_lon - ref_lon) * lon_to_meters
             terrain_y_max = (img_max_lat - ref_lat) * lat_to_meters
             
             terrain_mat = create_satellite_material(satellite_img_path)
+            image = bpy.data.images.get(os.path.basename(satellite_img_path))
+            if image is not None:
+                image["geo_attribution"] = source.attribution
+                image["geo_source"] = source.label
             satellite_ready = True
             print("[FlatGIS] Satellite image loaded successfully.")
         except Exception as e:
             print(f"[FlatGIS] Satellite download failed: {e}")
+            if warnings is not None:
+                warnings.append(f"Satellite imagery failed: {e}")
             
     # Generate Terrain Grid
     if settings.import_terrain or satellite_ready:
@@ -1237,15 +1214,21 @@ class FlatGISSettings(bpy.types.PropertyGroup):
     
     import_satellite: bpy.props.BoolProperty(
         name="Satellite Texture",
-        description="Fetch and map satellite texture",
+        description=(
+            "Fetch public-domain imagery for the terrain: USGS aerial imagery in the "
+            "US, NASA's 30 m Landsat 2000 composite elsewhere"
+        ),
         default=True
     )
     satellite_zoom: bpy.props.IntProperty(
         name="Zoom Level",
-        description="Satellite tile zoom level (higher is more detailed)",
+        description=(
+            "USGS imagery zoom level (higher is more detailed; 16 is about 1-2 m a "
+            "pixel). Outside the US, NASA's 30 m Landsat composite is used instead"
+        ),
         default=16,
         min=10,
-        max=19
+        max=16
     )
     
     clear_existing: bpy.props.BoolProperty(
@@ -1330,10 +1313,7 @@ def _join_words(words):
 
 
 def _satellite_tile_count(settings, bbox):
-    south, west, north, east = bbox
-    x1, y1 = latlon_to_tile(north, west, settings.satellite_zoom)
-    x2, y2 = latlon_to_tile(south, east, settings.satellite_zoom)
-    return (abs(x2 - x1) + 1) * (abs(y2 - y1) + 1)
+    return _satellite_plan(settings, bbox).tiles
 
 
 def _flat_preflight(settings, osm):
@@ -1359,7 +1339,7 @@ def _flat_preflight(settings, osm):
         tiles = _satellite_tile_count(settings, bbox)
         if tiles > _MAX_SATELLITE_TILES:
             raise RuntimeError(
-                f"Satellite imagery at zoom {settings.satellite_zoom} needs {tiles} "
+                f"Satellite imagery at zoom {min(settings.satellite_zoom, 16)} needs {tiles} "
                 f"tiles (limit {_MAX_SATELLITE_TILES}). Lower Zoom Level or shrink the area."
             )
 
@@ -1609,12 +1589,14 @@ class VIEW3D_PT_flat_gis_terrain(_FlatGISPanel, bpy.types.Panel):
         if settings.import_satellite:
             try:
                 bbox = osm_area.parse_bbox(osm_area.get(context))
+                tiles = _satellite_tile_count(settings, bbox)
             except RuntimeError:
                 return
-            tiles = _satellite_tile_count(settings, bbox)
             sub = col.row()
             sub.alert = tiles > _MAX_SATELLITE_TILES
             sub.label(text=f"{tiles} tiles (limit {_MAX_SATELLITE_TILES})")
+            osm_area.draw_wrapped(
+                col, "USGS imagery in the US; NASA 30 m Landsat (2000) elsewhere", icon="INFO")
 
 
 class VIEW3D_PT_flat_gis_geojson(_FlatGISPanel, bpy.types.Panel):
